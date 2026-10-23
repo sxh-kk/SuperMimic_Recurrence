@@ -274,11 +274,12 @@ def render_actual(model, recorded_qpos: np.ndarray, times: np.ndarray, summary: 
     mujoco.mjv_defaultCamera(camera)
     camera.distance, camera.azimuth, camera.elevation = 2.8, 130, -18
     label = summary["mode"]
+    truth_label = summary.get("render_truth_label", "actual uninterrupted physics")
     text_filter = (
         "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:"
         f"text='{label}':x=12:y=12:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.7,"
         "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:"
-        f"text='Outcome - {summary['outcome']} / actual uninterrupted physics':"
+        f"text='Outcome - {summary['outcome']} / {truth_label}':"
         "x=12:y=h-38:fontsize=18:fontcolor=white:box=1:boxcolor=black@0.7"
     )
     destination = args.out_dir / "rollout.mp4"
