@@ -47,8 +47,8 @@ def load_policy(path: Path, layout, device: str):
     allowed = {field.name for field in fields(JointLearningConfig)}
     if set(values) - allowed:
         raise ValueError(f"Unknown actor learning settings: {set(values) - allowed}")
-    for name in ("hidden", "policy_hidden", "reference_offsets"):
-        if name in values:
+    for name in ("hidden", "policy_hidden", "reference_offsets", "residual_limits_rad"):
+        if name in values and values[name] is not None:
             values[name] = tuple(values[name])
     config = JointLearningConfig(**values)
     if (
@@ -322,7 +322,7 @@ def render_actual(model, recorded_qpos: np.ndarray, times: np.ndarray, summary: 
     render_data = mujoco.MjData(model)
     robot = model.jnt_qposadr[model.joint("floating_base_joint").id]
     board = model.jnt_qposadr[model.joint("board_free").id]
-    frame_times = np.arange(int(np.floor(times[-1] * args.video_fps)) + 1) / args.video_fps
+    frame_times = np.arange(int(np.floor(times[-1] * args.video_fps + 1e-8)) + 1) / args.video_fps
     frame_ids = np.abs(times[:, None] - frame_times[None]).argmin(axis=0)
     try:
         with mujoco.Renderer(model, width=800, height=600) as renderer:

@@ -22,6 +22,7 @@ class JointLearningConfig:
     model_lr: float = 2e-4
     policy_lr: float = 1e-4
     residual_limit_rad: float = 0.25
+    residual_limits_rad: tuple[float, ...] | None = None
     reference_offsets: tuple[int, ...] = (0, 5, 10)
 
 
@@ -84,6 +85,12 @@ masked from the tracking goal; actual wheel motion remains a dynamics input.
         self.cfg = config or JointLearningConfig()
         self.layout = layout
         self.spec = JointStateSpec(layout, device=device)
+        limits = ((self.cfg.residual_limit_rad,) * 29 if self.cfg.residual_limits_rad is None
+                  else self.cfg.residual_limits_rad)
+        if len(limits) != 29 or any(not 0 < value < float("inf") for value in limits):
+            raise ValueError("policy requires 29 finite positive residual limits")
+        self.register_buffer("residual_limits", torch.tensor(limits, dtype=torch.float32, device=device),
+                             persistent=False)
         self.encoder = MLP(layout.delta_dim * len(self.cfg.reference_offsets), (256, 128), 32)
         self.decoder = MLP(layout.feature_dim + 32, self.cfg.policy_hidden, 29, zero_last=True)
         self.to(device)
@@ -100,7 +107,7 @@ masked from the tracking goal; actual wheel motion remains a dynamics input.
             ], dim=-1)
         latent = torch.tanh(self.encoder(errors.clamp(-20, 20).flatten(-2)))
         residual = torch.tanh(self.decoder(torch.cat([self.spec.canonical(state), latent], -1)))
-        return references[..., 0, 7:36] + self.cfg.residual_limit_rad * residual
+        return references[..., 0, 7:36] + self.residual_limits * residual
 
 
 def tracking_loss(

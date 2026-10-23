@@ -47,6 +47,7 @@ def main():
     parser.add_argument("--eval-every", type=int, default=10)
     parser.add_argument("--exploration", type=float, default=0.025)
     parser.add_argument("--residual-limit", type=float, default=0.25)
+    parser.add_argument("--residual-limits-json", type=Path)
     parser.add_argument("--root-pose-weight", type=float, default=0.25)
     parser.add_argument("--upright-weight", type=float, default=10.0)
     parser.add_argument("--wheel-model-weight", type=float, default=0.05)
@@ -74,6 +75,11 @@ def main():
     refs = torch.tensor(reference.state, dtype=torch.float32, device=args.device)
     confidence = torch.tensor(reference.confidence, dtype=torch.float32, device=args.device)
     cfg = JointLearningConfig(residual_limit_rad=args.residual_limit)
+    if args.residual_limits_json:
+        limits_document = json.loads(args.residual_limits_json.read_text())
+        if tuple(limits_document["joint_names"]) != G1_JOINT_NAMES:
+            raise ValueError("residual limit joint names/order differ")
+        cfg.residual_limits_rad = tuple(limits_document["limits_rad"])
     model = JointWorldModel(env.layout, cfg, args.device)
     policy = JointResidualPolicy(env.layout, cfg, args.device)
     wm_opt = torch.optim.Adam(model.parameters(), lr=cfg.model_lr)
@@ -87,10 +93,10 @@ def main():
             raise ValueError("warm-start bias joint names/order differ")
         bias_values = bias_document["bias_rad"]
         bias = torch.tensor(bias_values, dtype=torch.float32, device=args.device)
-        if bias.shape != (29,) or not torch.isfinite(bias).all() or (bias.abs() >= cfg.residual_limit_rad).any():
+        if bias.shape != (29,) or not torch.isfinite(bias).all() or (bias.abs() >= policy.residual_limits).any():
             raise ValueError("warm-start bias must be 29 finite values strictly inside residual bounds")
         with torch.no_grad():
-            policy.decoder.net[-1].bias.copy_(torch.atanh(bias / cfg.residual_limit_rad))
+            policy.decoder.net[-1].bias.copy_(torch.atanh(bias / policy.residual_limits))
     if args.wm_init:
         initial = torch.load(args.wm_init, map_location=args.device, weights_only=False)
         if tuple(initial["board_joint_names"]) != env.layout.board_joint_names:
@@ -100,7 +106,7 @@ def main():
         initial = torch.load(args.resume, map_location=args.device, weights_only=False)
         if initial["schema"] != "supermimic.ollie.actor.v1":
             raise ValueError("unsupported actor checkpoint")
-        if initial["learning_config"] != asdict(cfg):
+        if asdict(JointLearningConfig(**initial["learning_config"])) != asdict(cfg):
             raise ValueError("resume learning configuration differs")
         model.load_state_dict(initial["model"])
         policy.load_state_dict(initial["policy"])

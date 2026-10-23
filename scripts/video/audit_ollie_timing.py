@@ -202,7 +202,7 @@ def main():
         "caveats": [
             "Retargeted G1 has different mass distribution/proportions from the real person; its COM is not the person's measured COM.",
             "Monocular scale, root calibration, board fitting and contact IK alter the reconstructed trajectory.",
-            "Board fit already used a weak gravity prior with scale 1.5; this audit is not independent of that assumption.",
+            f"Board fit used a weak gravity prior (reference time scale {reference.metadata['time_scale']}); this audit is not independent of that assumption.",
             "Fitted sample count includes temporal interpolation; residuals/window sensitivity do not bound reconstruction bias.",
             "One constant time scale cannot repair a visibly non-parabolic reference or unknown external support.",
         ],
