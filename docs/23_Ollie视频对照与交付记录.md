@@ -25,3 +25,11 @@ env -u PYTHONPATH -u PYTHONHOME uv run --locked python \
 首轮学习控制尚未进入有效起跳；第二轮通过站稳热启动、长回合采集及独立CPU筛选改进。另一路PD参数搜索的旧代理曾提示离地，完整几何复核未确认合格全板腾空，且接板失败，详见文档14/28的更正。最终必须分别说明动作相似程度、连续物理成功、训练算法和验收结果，不能由三栏视频中看似正确的中栏代替右栏。
 
 第二轮30轮训练已结束，最新可查看对照为 `logs/ollie_comparison/pilot02_best/comparison.mp4`，右栏使用独立CPU实际筛选的第20轮状态，首次机器人触地2.135s，仍FAILED。原生实际视频为 `logs/ollie_actor_pilot_02/native_0020/rollout.mp4`，由原保存qpos离线渲染，实际物理记录及接触统计没有修改。它比首轮晚摔倒，但未完成起跳/接板，详细训练结果见文档16。
+
+## 准备段前馈与行为克隆的新增视频
+
+已提供 `logs/ollie_quasistatic/preparation_video/rollout.mp4`：真实原生控制的0～2.76s准备/下蹲阶段，800×600/H264/50fps/139帧，标签明确 `PREFIX ONLY / actual physics / Ollie still incomplete`。从实际139个边界qpos离线渲染，没有参考机器人叠加、根/板逐帧覆盖或板驱动。已抽查末帧和容器，属于有限动态前缀，详见文档29。
+
+完整前馈衔接对照在 `logs/ollie_quasistatic/full_continuation_v1/{immediate_reference,pop06}/rollout.mp4`，两段都标明FAILED，保留倒地之后的板运动，详见文档31。
+
+最新行为克隆/DAgger初始化的独立完整视频为 `logs/ollie_bc_prefix_03/native_full/rollout.mp4`，实际5.14s，800×600/H264/50fps/258帧。准备段已进步，但3.255s首次触地，完整结果FAILED；该视频不能称世界模型训练后的Ollie复现。原空中参考几何仍需修正，最终交付仍待真实腾空、接板与落地通过。
