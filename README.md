@@ -4,6 +4,8 @@
 
 - [项目记录与文档索引](docs/00_项目记录.md)
 - [调研与复现方案](docs/01_调研与复现方案.md)
+- [本机环境适配](docs/02_本机环境适配.md)
+- [本机验证与运行](docs/03_本机验证与运行.md)
 - [上游原始说明](docs/UPSTREAM_README.md)
 
 上游：CuboiLeo/SuperMimic-Reproduced，提交 `d9be385b3eeb13a638fb33fb200d3bfd9be9839f`。保留原 MIT 许可证。本项目尚未获得论文指标复现结论。
