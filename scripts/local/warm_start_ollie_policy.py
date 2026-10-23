@@ -37,6 +37,7 @@ def main():
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--teacher", type=Path, required=True)
     parser.add_argument("--base-residual-limits", type=Path, required=True)
+    parser.add_argument("--policy-init", type=Path, help="Weights-only initialization; refitted to this teacher/goals")
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--updates", type=int, default=3000)
     parser.add_argument("--eval-every", type=int, default=500)
@@ -117,9 +118,17 @@ def main():
     model_optimizer = torch.optim.Adam(model.parameters(), lr=config.model_lr)
     actor_optimizer = torch.optim.Adam(policy.parameters(), lr=config.policy_lr)
     s, a, g = [torch.as_tensor(v, dtype=torch.float32, device=args.device) for v in (state, action, goals)]
-    with torch.no_grad():
-        average = ((a - g[:, 0, 7:36]) / policy.residual_limits).mean(0).clamp(-0.999, 0.999)
-        policy.decoder.net[-1].bias.copy_(torch.atanh(average))
+    if args.policy_init:
+        previous = torch.load(args.policy_init, map_location=args.device, weights_only=True)
+        if (previous.get("schema") != "supermimic.ollie.actor.v1"
+                or tuple(previous["board_joint_names"]) != BOARD_JOINT_NAMES
+                or asdict(JointLearningConfig(**previous["learning_config"])) != asdict(config)):
+            raise ValueError("initial policy network/limit/goal contract differs")
+        policy.load_state_dict(previous["policy"], strict=True)
+    else:
+        with torch.no_grad():
+            average = ((a - g[:, 0, 7:36]) / policy.residual_limits).mean(0).clamp(-0.999, 0.999)
+            policy.decoder.net[-1].bias.copy_(torch.atanh(average))
     history = []
     best_native_cost = float("inf")
 
@@ -135,6 +144,8 @@ def main():
             "policy_updates_completed": 0, "behavior_cloning_updates_completed": update,
             "policy_initialization": "behavior_cloning", "world_model_trained": False,
             "teacher": str(args.teacher.resolve()), "teacher_sha256": digest(args.teacher),
+            "policy_initialization_source": str(args.policy_init.resolve()) if args.policy_init else None,
+            "policy_initialization_source_sha256": digest(args.policy_init) if args.policy_init else None,
             "teacher_verified_seconds": count / 50, "teacher_metrics": teacher_metrics,
             "seed": args.seed, "ollie_success_certified": False,
             "observations": "full simulator state engineering prototype",

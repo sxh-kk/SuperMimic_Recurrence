@@ -64,6 +64,7 @@ def main():
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--teacher-anchor", type=Path)
     parser.add_argument("--teacher-weight", type=float, default=10.0)
+    parser.add_argument("--actor-lr", type=float, help="Explicit optimizer learning-rate override after resume")
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--collect-steps", type=int, default=48)
@@ -90,9 +91,12 @@ def main():
         parser.error("reference penetration threshold must be finite and nonnegative")
     if not math.isfinite(args.teacher_weight) or args.teacher_weight < 0:
         parser.error("teacher anchor weight must be finite and nonnegative")
+    if args.actor_lr is not None and (not math.isfinite(args.actor_lr) or args.actor_lr <= 0):
+        parser.error("actor learning rate must be finite and positive")
     if (args.num_envs < 8 or args.iterations < 1 or args.model_window < 1
             or args.collect_steps < args.model_window or args.horizon < 1
-            or args.batch_size < 1 or args.eval_every < 1 or args.replay_chunks < 1):
+            or args.batch_size < 1 or args.eval_every < 1 or args.replay_chunks < 1
+            or args.model_updates < 1 or args.policy_updates < 0):
         parser.error("positive budgets and at least eight environments required")
     if (args.out_dir / "latest.pt").exists():
         parser.error("choose a fresh output directory; --resume reads a separate checkpoint")
@@ -139,11 +143,6 @@ def main():
             raise ValueError("warm-start bias must be 29 finite values strictly inside residual bounds")
         with torch.no_grad():
             policy.decoder.net[-1].bias.copy_(torch.atanh(bias / policy.residual_limits))
-    if args.wm_init:
-        initial = torch.load(args.wm_init, map_location=args.device, weights_only=False)
-        if tuple(initial["board_joint_names"]) != env.layout.board_joint_names:
-            raise ValueError("initial world model joint schema differs")
-        model.load_state_dict(initial["model"])
     if args.resume:
         initial = torch.load(args.resume, map_location=args.device, weights_only=False)
         if initial["schema"] != "supermimic.ollie.actor.v1":
@@ -160,6 +159,18 @@ def main():
         actor_updates_done = initial.get("policy_updates_completed", 0)
         bc_updates_done = initial.get("behavior_cloning_updates_completed", 0)
         policy_initialization = initial.get("policy_initialization", "resumed_policy")
+    if args.wm_init:
+        # An explicit model initializer must win over the model bundled with a
+        # resumed BC actor (which is deliberately untrained). Its optimizer is
+        # fresh so stale moments from the replaced model cannot leak through.
+        initial = torch.load(args.wm_init, map_location=args.device, weights_only=False)
+        if tuple(initial["board_joint_names"]) != env.layout.board_joint_names:
+            raise ValueError("initial world model joint schema differs")
+        model.load_state_dict(initial["model"])
+        wm_opt = torch.optim.Adam(model.parameters(), lr=cfg.model_lr)
+    if args.actor_lr is not None:
+        for group in actor_opt.param_groups:
+            group["lr"] = args.actor_lr
     anchor = None
     if args.teacher_anchor:
         with np.load(args.teacher_anchor, allow_pickle=False) as teacher:
