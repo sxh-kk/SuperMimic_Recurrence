@@ -44,6 +44,8 @@ def save_candidate(problem, parameters, out_dir, *, seconds, balance, render, pl
     model, index = problem.model, problem.index
     if not np.isclose(model.opt.timestep, PHYSICS_DT):
         raise ValueError("Shared continuous-flight certification currently requires 2.5 ms physics")
+    if mujoco.get_mjcb_control() is not None:
+        raise RuntimeError("Save requires no global control callback, including at initialization")
     data = mujoco.MjData(model)
     data.qpos[:], data.qvel[:] = problem.qpos, problem.qvel
     mujoco.mj_forward(model, data)
@@ -55,7 +57,15 @@ def save_candidate(problem, parameters, out_dir, *, seconds, balance, render, pl
     callback = feedback_callback(problem, balance=balance, placement=placement, balance_gains=balance_gains)
     support_contact = FootBoardSupport(model)
     observer = ContactObserver(model, index, 0.1)
-    physical_records = [observer.observe(data)]
+
+    def physical_record():
+        record = observer.observe(data)
+        loads = support_contact.vertical_loads(data)
+        for side, load in zip(("left", "right"), loads, strict=True):
+            record[f"{side}_deck_upward_normal_load_n"] = float(load)
+        return record
+
+    physical_records = [physical_record()]
     previous = mujoco.get_mjcb_control()
     try:
         mujoco.set_mjcb_control(None)
@@ -77,7 +87,7 @@ def save_candidate(problem, parameters, out_dir, *, seconds, balance, render, pl
             qvel.append(data.qvel.copy())
             contacts = contact_summary(model, data)
             support_loads = support_contact.vertical_loads(data)
-            physical = observer.observe(data)
+            physical = physical_record()
             physical_records.append(physical)
             mujoco.mj_energyPos(model, data)
             mujoco.mj_energyVel(model, data)
@@ -108,6 +118,11 @@ def save_candidate(problem, parameters, out_dir, *, seconds, balance, render, pl
     certification["criteria"]["board_flight_clearance_at_least_15mm"] = (
         certification["maximum_whole_board_clearance_m"] >= 0.015
     )
+    final = [row for row in physical_records if row["time_physics"] >= seconds - 0.3 + 1e-8]
+    for side in ("left", "right"):
+        supported = float(np.mean([row[f"{side}_deck_upward_normal_load_n"] > 1 for row in final]))
+        certification["final_contact_fractions"][f"{side}_upward_support_over_1n"] = supported
+        certification["criteria"][f"final_{side}_foot_upward_top_support"] = supported >= 0.8
     certification["failure_reasons"] = [name for name, passed in certification["criteria"].items() if not passed]
     completed = not certification["failure_reasons"]
     certification["success"] = completed
@@ -265,6 +280,7 @@ def main():
     parser.add_argument("--linear-leg-pose", action="store_true")
     parser.add_argument("--catch-priority", action="store_true")
     parser.add_argument("--balance-support-com", action="store_true")
+    parser.add_argument("--gravity-seed", action="store_true")
     parser.add_argument("--no-render", action="store_true")
     args = parser.parse_args()
     try:
@@ -286,7 +302,8 @@ def main():
                                    root_y_offset=args.root_y_offset,
                                    coordinated_ik=not args.linear_leg_pose,
                                    balance_support_com=args.balance_support_com,
-                                   catch_priority=args.catch_priority)
+                                   catch_priority=args.catch_priority,
+                                   gravity_seed=args.gravity_seed)
     generator = np.random.default_rng(args.seed)
     mean, deviation = DEFAULT.copy(), (UPPER - LOWER) * 0.30
     if args.initial_search:
