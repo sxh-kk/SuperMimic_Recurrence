@@ -16,7 +16,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 from scipy.optimize import lsq_linear
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 
 from scripts.video.repair_ollie_air_reference import Geometry
 from scripts.video.repair_ollie_self_collisions import category
@@ -57,6 +57,8 @@ class TailRepair:
         self.jp2 = np.zeros_like(self.jp)
         self.jr2 = np.zeros_like(self.jp)
         self.tangent = np.zeros(self.model.nv)
+        self.pelvis = self.model.body("pelvis").id
+        self.torso = self.model.body("torso_link").id
         self.stance_end = round(args.left_contact_end * reference.metadata["physics_fps"])
         self.right_end = round(args.right_contact_end * reference.metadata["physics_fps"])
         self.release_end = round(args.release_end * reference.metadata["physics_fps"])
@@ -191,6 +193,28 @@ class TailRepair:
                 prior_weight = np.r_[np.full(3, 0.8), np.full(3, 1.5), np.full(15, 0.5)]
                 a.append(np.diag(prior_weight))
                 b.append(self.tangent[self.dofs] * prior_weight)
+                if args.minimum_pelvis_upright is not None:
+                    # Positive d(upright)/d(angular velocity), in world coordinates.
+                    normal = d.xmat[self.pelvis].reshape(3, 3)[:, 2]
+                    upright = normal[2]
+                    requested = args.minimum_pelvis_upright + args.upright_margin
+                    if upright < requested:
+                        mujoco.mj_jacBody(m, d, self.jp, self.jr, self.pelvis)
+                        gradient = (
+                            np.cross(normal, np.array([0.0, 0.0, 1.0])) @ self.jr[:, self.dofs]
+                        )
+                        a.append(gradient[None] * args.upright_weight)
+                        b.append(np.array([requested - upright]) * args.upright_weight)
+                    # Retain source torso orientation using available waist DoFs.
+                    current_torso = d.xmat[self.torso].reshape(3, 3).copy()
+                    mujoco.mj_jacBody(m, d, self.jp, self.jr, self.torso)
+                    torso_jac = self.jr[:, self.dofs].copy()
+                    self.assign(source)
+                    desired_torso = d.xmat[self.torso].reshape(3, 3).copy()
+                    self.assign(q)
+                    torso_error = Rotation.from_matrix(desired_torso @ current_torso.T).as_rotvec()
+                    a.append(torso_jac * args.torso_orientation_weight)
+                    b.append(torso_error * args.torso_orientation_weight)
                 active = [0, 1] if frame <= self.stance_end else [1]
                 for side in active:
                     jac, err, jrot, errot = self.contact_target(side)
@@ -233,6 +257,10 @@ class TailRepair:
                     np.dot(self.contact_target(side)[1], self.contact_target(side)[1])
                     for side in active
                 )
+                if args.minimum_pelvis_upright is not None:
+                    u_old = d.xmat[self.pelvis].reshape(3, 3)[2, 2]
+                    deficit = max(args.minimum_pelvis_upright + args.upright_margin - u_old, 0.0)
+                    old_err += (deficit * args.upright_weight / args.position_weight) ** 2
                 accepted = False
                 for alpha in (1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125):
                     trial = q.copy()
@@ -247,7 +275,13 @@ class TailRepair:
                         np.dot(self.contact_target(side)[1], self.contact_target(side)[1])
                         for side in active
                     )
-                    # Permit ≤0.8mm existing self overlap while recovering geometry,
+                    if args.minimum_pelvis_upright is not None:
+                        u_new = d.xmat[self.pelvis].reshape(3, 3)[2, 2]
+                        deficit = max(
+                            args.minimum_pelvis_upright + args.upright_margin - u_new, 0.0
+                        )
+                        err += (deficit * args.upright_weight / args.position_weight) ** 2
+                    # Permit small existing self overlap while recovering geometry,
                     # never trade a deep body/deck collision for smaller foot error.
                     if pen <= max(old_pen, args.collision_margin) + 1e-6 and err <= old_err + 1e-7:
                         q = trial
@@ -378,6 +412,15 @@ def main():
     parser.add_argument("--position-weight", type=float, default=120.0)
     parser.add_argument("--orientation-weight", type=float, default=12.0)
     parser.add_argument("--collision-margin", type=float, default=0.0005)
+    parser.add_argument(
+        "--minimum-pelvis-upright",
+        type=float,
+        default=None,
+        help="Opt-in lower bound during solved contact phase; default preserves v3 algorithm",
+    )
+    parser.add_argument("--upright-margin", type=float, default=0.005)
+    parser.add_argument("--upright-weight", type=float, default=300.0)
+    parser.add_argument("--torso-orientation-weight", type=float, default=15.0)
     args = parser.parse_args()
     if args.out_dir.exists() or args.diagnostics.exists():
         raise FileExistsError(
@@ -388,6 +431,12 @@ def main():
     if args.max_joint_velocity <= 0 or args.iterations < 1 or args.support_gap < 0:
         raise ValueError(
             "Positive velocity/iteration settings and nonnegative support gap required"
+        )
+    if args.minimum_pelvis_upright is not None and not (0.0 < args.minimum_pelvis_upright < 1.0):
+        raise ValueError("Requested upright must lie between0 and1")
+    if args.upright_margin < 0 or args.upright_weight <= 0 or args.torso_orientation_weight < 0:
+        raise ValueError(
+            "Upright margin/torso weight nonnegative, upright weight positive required"
         )
     source = JointReference.load(args.source)
     if source.metadata["physics_fps"] != 50.0 or source.metadata["time_scale"] != 1.5:
@@ -478,6 +527,33 @@ def main():
             "Preparation prefix changed; old teacher/BC must not be reused as hash-compatible",
         ],
     }
+    # Check the requested pelvis requirement over the same2.5ms pose interpolation.
+    dense_time = np.arange((len(source.time_physics) - 1) * 8 + 1) * 0.0025
+    rotations = Rotation.from_quat(result.robot_state[:, [4, 5, 6, 3]])
+    dense_upright = Slerp(source.time_physics, rotations)(dense_time).as_matrix()[:, 2, 2]
+    prepare = dense_time <= args.left_contact_end + 1e-9
+    report["minimum_prepare_pelvis_upright_dense"] = float(dense_upright[prepare].min())
+    report["minimum_pelvis_upright_requested"] = args.minimum_pelvis_upright
+    report["upright_pass"] = bool(
+        args.minimum_pelvis_upright is None
+        or report["minimum_prepare_pelvis_upright_dense"] >= args.minimum_pelvis_upright
+    )
+    report["kinematic_candidate_passed"] &= report["upright_pass"]
+    np.savez_compressed(
+        args.diagnostics / "pelvis_upright_dense.npz",
+        time_physics=dense_time,
+        upright=dense_upright,
+    )
+    torso_errors = []
+    for old, new in zip(
+        repair.source, repair.geometry.poses(result.robot_state, result.board_state), strict=True
+    ):
+        repair.assign(old)
+        original = repair.data.xmat[repair.torso].reshape(3, 3).copy()
+        repair.assign(new)
+        changed = repair.data.xmat[repair.torso].reshape(3, 3).copy()
+        torso_errors.append(np.linalg.norm(Rotation.from_matrix(changed @ original.T).as_rotvec()))
+    report["max_torso_orientation_change_rad"] = float(max(torso_errors))
     report["surface_contact_label_meaning"] = (
         "Engineering prior, not observed3D points or measured forces"
     )
