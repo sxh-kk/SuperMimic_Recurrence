@@ -143,6 +143,7 @@ masked from the tracking goal; actual wheel motion remains a dynamics input.
 def tracking_loss(
     spec: JointStateSpec, state: torch.Tensor, target: torch.Tensor,
     board_confidence: torch.Tensor | None = None,
+    board_weight: float = 1.0,
 ) -> torch.Tensor:
     """Differentiable engineering tracking objective; no fictitious contact force.
 
@@ -153,4 +154,4 @@ is still required for contact timing, success, penetration, and energy checks.
     robot = error[..., :70]
     board_root = error[..., 70:82]
     confidence = 1.0 if board_confidence is None else board_confidence.clamp(0.1, 1)
-    return 0.5 * robot.square().mean(-1) + confidence * board_root.square().mean(-1)
+    return 0.5 * robot.square().mean(-1) + board_weight * confidence * board_root.square().mean(-1)

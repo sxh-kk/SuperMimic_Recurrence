@@ -68,6 +68,11 @@ def main():
     parser.add_argument("--teacher-anchor", type=Path)
     parser.add_argument("--teacher-weight", type=float, default=10.0)
     parser.add_argument("--actor-lr", type=float, help="Explicit optimizer learning-rate override after resume")
+    parser.add_argument("--freeze-world-model", action="store_true")
+    parser.add_argument("--board-actor-weight", type=float, default=1.0)
+    parser.add_argument("--actor-detach-board-state", action="store_true")
+    parser.add_argument("--actor-frame-start", type=int, help="Inclusive actor start-state frame bound")
+    parser.add_argument("--actor-frame-end", type=int, help="Inclusive start-state bound; imagination extends past it")
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--collect-steps", type=int, default=48)
@@ -96,6 +101,15 @@ def main():
         parser.error("teacher anchor weight must be finite and nonnegative")
     if args.actor_lr is not None and (not math.isfinite(args.actor_lr) or args.actor_lr <= 0):
         parser.error("actor learning rate must be finite and positive")
+    if not math.isfinite(args.board_actor_weight) or args.board_actor_weight < 0:
+        parser.error("board actor weight must be finite and nonnegative")
+    if args.freeze_world_model and not (args.wm_init or args.resume):
+        parser.error("a frozen world model requires trained weights")
+    if ((args.actor_frame_start is not None and args.actor_frame_start < 0)
+            or (args.actor_frame_end is not None and args.actor_frame_end < 0)
+            or (args.actor_frame_start is not None and args.actor_frame_end is not None
+                and args.actor_frame_start > args.actor_frame_end)):
+        parser.error("actor frame interval must be nonnegative and ordered")
     if args.policy_init and (args.resume or args.warm_start_bias):
         parser.error("policy-init is a weights-only alternative to resume or fixed bias")
     if args.frozen_prefix_frame is not None and not (args.policy_init or args.resume):
@@ -112,6 +126,9 @@ def main():
     torch.manual_seed(args.seed)
     started = time.monotonic()
     reference = JointReference.load(args.reference)
+    if any(value is not None and value >= len(reference.state)
+           for value in (args.actor_frame_start, args.actor_frame_end, args.frozen_prefix_frame)):
+        parser.error("curriculum frame bounds must lie inside the loaded reference")
     env_cfg = JointEnvConfig(num_envs=args.num_envs)
     if reference.metadata["physics_fps"] != 1 / env_cfg.control_dt:
         raise ValueError("reference and simulator control rates differ")
@@ -251,6 +268,12 @@ def main():
         upright = 1 - 2 * (candidates[..., 4].square() + candidates[..., 5].square())
         valid = (upright > 0.5) & (candidates[..., 2] - candidates[..., 73] > 0.4)
         valid &= (candidates[..., :2] - candidates[..., 71:73]).norm(dim=-1) < 0.6
+        candidate_frames = (replay_frames[:, None, :train_count]
+                            + torch.arange(args.collect_steps, device=args.device)[None, :, None])
+        if args.actor_frame_start is not None:
+            valid &= candidate_frames >= args.actor_frame_start
+        if args.actor_frame_end is not None:
+            valid &= candidate_frames <= args.actor_frame_end
         locations = valid.nonzero()
         if not len(locations):
             raise RuntimeError("no recoverable real actor start states")
@@ -354,9 +377,10 @@ def main():
         replay_states = torch.stack([chunk[0] for chunk in replay])
         replay_actions = torch.stack([chunk[1] for chunk in replay])
         replay_frames = torch.stack([chunk[2] for chunk in replay])
-        model.requires_grad_(True)
-        model.train()
-        for _ in range(args.model_updates):
+        model.requires_grad_(not args.freeze_world_model)
+        model.train(not args.freeze_world_model)
+        wm_loss = refs.new_zeros(())
+        for _ in range(0 if args.freeze_world_model else args.model_updates):
             batch_states, batch_actions, _ = sample_windows(True, args.batch_size, args.model_window)
             wm_loss, _ = model.window_loss(batch_states, batch_actions, args.wheel_model_weight)
             wm_opt.zero_grad(set_to_none=True)
@@ -385,7 +409,10 @@ def main():
                 target_frame = (frame + step + 1).clamp(max=len(refs) - 1)
                 action = policy(predicted, goals(target_frame), frame=target_frame).clamp(lower, upper)
                 predicted = model.step(predicted, action)
-                loss = tracking_loss(model.spec, predicted, refs[target_frame], confidence[target_frame])
+                if args.actor_detach_board_state:
+                    predicted = torch.cat([predicted[..., :71], predicted[..., 71:].detach()], -1)
+                loss = tracking_loss(model.spec, predicted, refs[target_frame], confidence[target_frame],
+                                     board_weight=args.board_actor_weight)
                 root_error = model.spec.error_vector(predicted, refs[target_frame])[..., :6]
                 upright = 1 - 2 * (predicted[..., 4].square() + predicted[..., 5].square())
                 stability = args.root_pose_weight * root_error.square().mean()
@@ -417,6 +444,7 @@ def main():
                **{key: float(value) for key, value in validation_details.items()},
                "actor_loss": float(actor_loss.detach()), "actor_gradient": float(actor_gradient)}
         row["teacher_anchor_loss"] = float(anchor_loss.detach())
+        row["world_model_updates_this_iteration"] = 0 if args.freeze_world_model else args.model_updates
         row["policy_updates_completed"] = actor_updates_done
         if iteration % args.eval_every == 0 or iteration == args.iterations:
             real = real_evaluate(iteration)
