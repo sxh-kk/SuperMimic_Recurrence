@@ -76,6 +76,7 @@ class ContactObserver:
             i for i, name in enumerate(self.names) if name.startswith(("board_", "wheel_"))
         }
         self.deck = {model.geom(name).id for name in BOARD_GEOM_NAMES}
+        self.top_surfaces = {model.geom(name).id for name in ("board_center", "board_tail", "board_nose")}
         self.wheels = [
             model.geom(name.removesuffix("_joint") + "_collision").id for name in BOARD_JOINT_NAMES
         ]
@@ -93,6 +94,7 @@ class ContactObserver:
         wheel_contact = set()
         foot_board = {"left": False, "right": False}
         foot_ground = {"left": False, "right": False}
+        foot_upward_support = {"left": 0.0, "right": 0.0}
         board_ground, robot_ground, tail_ground, nose_ground = set(), set(), False, False
         active_pairs = set()
         maximum_penetration, maximum_normal_force = 0.0, 0.0
@@ -120,6 +122,18 @@ class ContactObserver:
                     foot_ground[side] |= other in feet
             for side, feet in self.feet.items():
                 foot_board[side] |= bool(geoms & feet) and bool(geoms & self.deck)
+                first, second = map(int, contact.geom)
+                surface = second if first in feet else first if second in feet else None
+                if surface not in self.top_surfaces:
+                    continue
+                # Contact normal points from geom0 to geom1; support must act
+                # upwards on the foot and on the deck's upper face, not an axle
+                # or an underside/side collision that merely has normal force.
+                normal_on_foot = np.asarray(contact.frame[:3]) * (-1 if first in feet else 1)
+                rotation = data.geom_xmat[surface].reshape(3, 3)
+                local_contact = rotation.T @ (contact.pos - data.geom_xpos[surface])
+                if local_contact[2] >= 0 and normal_on_foot @ rotation[:, 2] > 0.5:
+                    foot_upward_support[side] += normal_force * max(float(normal_on_foot[2]), 0)
         clearance = []
         for geom in self.wheels:
             # MuJoCo cylinder axis is geom-local Z, including its authored quat.
@@ -144,6 +158,8 @@ class ContactObserver:
             "nose_ground": bool(nose_ground),
             "left_foot_board": bool(foot_board["left"]),
             "right_foot_board": bool(foot_board["right"]),
+            "left_foot_deck_upward_support_n": foot_upward_support["left"],
+            "right_foot_deck_upward_support_n": foot_upward_support["right"],
             "left_foot_ground": bool(foot_ground["left"]),
             "right_foot_ground": bool(foot_ground["right"]),
             "active_contact_pairs": len(active_pairs),
@@ -213,11 +229,17 @@ def outcome(records: list[dict], *, full_reference: bool, numerical_failure: str
     fractions["all_four_wheels_ground"] = float(
         np.mean([row["unique_wheels_ground"] == 4 for row in final])
     )
+    for side in ("left", "right"):
+        fractions[f"{side}_foot_top_supported_above_1n"] = float(np.mean([
+            row[f"{side}_foot_deck_upward_support_n"] > 1.0 for row in final
+        ]))
     stable = (
         len(final) >= 100
         and fractions["all_four_wheels_ground"] >= 0.8
         and fractions["left_foot_board"] >= 0.8
         and fractions["right_foot_board"] >= 0.8
+        and fractions["left_foot_top_supported_above_1n"] >= 0.8
+        and fractions["right_foot_top_supported_above_1n"] >= 0.8
         and min(row["robot_upright_cosine"] for row in final) >= 0.8
         and min(row["board_upright_cosine"] for row in final) >= 0.95
         and max(row["robot_linear_speed_m_s"] for row in final) <= 0.3
@@ -250,7 +272,7 @@ def outcome(records: list[dict], *, full_reference: bool, numerical_failure: str
     return {
         "success": all(rules.values()),
         "outcome": "SUCCESS" if all(rules.values()) else "FAILED",
-        "criteria_version": "whole_board_geometry_v2",
+        "criteria_version": "whole_board_geometry_top_support_v3",
         "criteria": rules,
         "failure_reasons": [name for name, passed in rules.items() if not passed],
         "numerical_failure": numerical_failure,
@@ -460,9 +482,15 @@ def _evaluate(args) -> dict:
             "reference_sha256": sha256(args.reference),
             "checkpoint": str(args.ckpt) if args.ckpt else None,
             "checkpoint_sha256": sha256(args.ckpt) if args.ckpt else None,
+            "policy_bptt_updates": checkpoint.get("policy_updates_completed", 0) if checkpoint else 0,
+            "policy_behavior_cloning_updates": checkpoint.get("behavior_cloning_updates_completed", 0)
+            if checkpoint else 0,
             "checkpoint_iteration": checkpoint.get("iteration") if checkpoint else None,
             "mode": "Reference PD baseline"
             if args.reference_pd
+            else "Behavior-cloned preparation initialization"
+            if checkpoint.get("behavior_cloning_updates_completed", 0) > 0
+            and checkpoint.get("policy_updates_completed", 0) == 0
             else "PD initialization (untrained)"
             if checkpoint.get("policy_updates_completed") == 0
             else "Learned full-state prototype",
