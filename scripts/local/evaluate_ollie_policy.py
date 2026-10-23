@@ -273,7 +273,7 @@ def render_actual(model, recorded_qpos: np.ndarray, times: np.ndarray, summary: 
     camera = mujoco.MjvCamera()
     mujoco.mjv_defaultCamera(camera)
     camera.distance, camera.azimuth, camera.elevation = 2.8, 130, -18
-    label = "Reference PD baseline" if args.reference_pd else "Learned full-state prototype"
+    label = summary["mode"]
     text_filter = (
         "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:"
         f"text='{label}':x=12:y=12:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.7,"
@@ -460,6 +460,8 @@ def _evaluate(args) -> dict:
             "checkpoint_iteration": checkpoint.get("iteration") if checkpoint else None,
             "mode": "Reference PD baseline"
             if args.reference_pd
+            else "PD initialization (untrained)"
+            if checkpoint.get("policy_updates_completed") == 0
             else "Learned full-state prototype",
             "physics": "native CPU MuJoCo",
             "mujoco_version": mujoco.__version__,

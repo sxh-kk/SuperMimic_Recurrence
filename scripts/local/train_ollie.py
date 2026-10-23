@@ -16,6 +16,7 @@ from pathlib import Path
 
 import torch
 
+from supermimic.data.motion_convert import G1_JOINT_NAMES
 from supermimic.ollie.gpu_env import JointEnvConfig, JointPhysicsEnv
 from supermimic.ollie.learning import (
     JointLearningConfig,
@@ -37,6 +38,7 @@ def main():
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--collect-steps", type=int, default=48)
     parser.add_argument("--model-updates", type=int, default=100)
+    parser.add_argument("--model-warmup-iterations", type=int, default=0)
     parser.add_argument("--policy-updates", type=int, default=20)
     parser.add_argument("--model-window", type=int, default=8)
     parser.add_argument("--horizon", type=int, default=24)
@@ -76,10 +78,14 @@ def main():
     policy = JointResidualPolicy(env.layout, cfg, args.device)
     wm_opt = torch.optim.Adam(model.parameters(), lr=cfg.model_lr)
     actor_opt = torch.optim.Adam(policy.parameters(), lr=cfg.policy_lr)
+    actor_updates_done = 0
     if args.warm_start_bias:
         if args.resume:
             raise ValueError("choose resume or initial fixed bias, not both")
-        bias_values = json.loads(args.warm_start_bias.read_text())["bias_rad"]
+        bias_document = json.loads(args.warm_start_bias.read_text())
+        if tuple(bias_document["joint_names"]) != G1_JOINT_NAMES:
+            raise ValueError("warm-start bias joint names/order differ")
+        bias_values = bias_document["bias_rad"]
         bias = torch.tensor(bias_values, dtype=torch.float32, device=args.device)
         if bias.shape != (29,) or not torch.isfinite(bias).all() or (bias.abs() >= cfg.residual_limit_rad).any():
             raise ValueError("warm-start bias must be 29 finite values strictly inside residual bounds")
@@ -100,6 +106,7 @@ def main():
         policy.load_state_dict(initial["policy"])
         wm_opt.load_state_dict(initial["model_optimizer"])
         actor_opt.load_state_dict(initial["policy_optimizer"])
+        actor_updates_done = initial.get("policy_updates_completed", 0)
     offsets = torch.tensor(cfg.reference_offsets, device=args.device)
     lower = env.joint_limits[:, 0] + 0.005
     upper = env.joint_limits[:, 1] - 0.005
@@ -188,6 +195,7 @@ def main():
                     "environment_config": asdict(env_cfg),
                     "board_joint_names": env.layout.board_joint_names,
                     "reference": str(args.reference.resolve()), "iteration": iteration,
+                    "policy_updates_completed": actor_updates_done,
                     "training_arguments": {key: str(value) if isinstance(value, Path) else value
                                            for key, value in vars(args).items()},
                     "seed": args.seed, "observations": "full simulator state engineering prototype",
@@ -257,7 +265,8 @@ def main():
         model.eval().requires_grad_(False)
         actor_loss = refs.new_zeros(())
         actor_gradient = refs.new_zeros(())
-        for _ in range(args.policy_updates):
+        updates_this_iteration = 0 if iteration <= args.model_warmup_iterations else args.policy_updates
+        for _ in range(updates_this_iteration):
             predicted, previous, frame = actor_start_states()
             predicted, previous = predicted.detach(), previous.detach()
             actor_loss = predicted.new_zeros(())
@@ -284,11 +293,13 @@ def main():
             if not torch.isfinite(actor_gradient):
                 raise RuntimeError("nonfinite actor gradient")
             actor_opt.step()
+            actor_updates_done += 1
         row = {"iteration": iteration, "seconds": time.monotonic() - started,
                "physical_transitions": iteration * args.num_envs * args.collect_steps,
                "world_model_loss": float(wm_loss.detach()), "heldout_model_loss": float(validation),
                **{key: float(value) for key, value in validation_details.items()},
                "actor_loss": float(actor_loss.detach()), "actor_gradient": float(actor_gradient)}
+        row["policy_updates_completed"] = actor_updates_done
         if iteration % args.eval_every == 0 or iteration == args.iterations:
             real = real_evaluate(iteration)
             save(args.out_dir / "candidate.pt", iteration)
