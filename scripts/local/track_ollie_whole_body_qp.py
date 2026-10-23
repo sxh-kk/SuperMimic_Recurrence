@@ -31,7 +31,10 @@ from supermimic.ollie.state import JointStateIndices
 
 
 class PreparationQP:
-    def __init__(self, reference):
+    def __init__(self, reference, *, posture_priority="legacy"):
+        if posture_priority not in ("legacy", "strong"):
+            raise ValueError("posture priority must be legacy or strong")
+        self.posture_priority = posture_priority
         self.reference = reference
         self.model, self.data, self.index = compile_scene(timestep=0.0025)
         m, x = self.model, self.index
@@ -216,8 +219,12 @@ class PreparationQP:
         b = [task_weights * (np.concatenate(desired) - task_bias - task_j @ constant)]
         joint_goal = (60 * (self.reference.robot_state[goal, 7:36] - q)
                       + 14 * (self.reference.robot_state[goal, 42:71] - qd) + self.ref_qacc[goal])
-        joint_scale = np.r_[np.full(15, 30.), np.full(14, 80.)]
-        joint_scale[[20, 21, 27, 28]] = 500.
+        if self.posture_priority == "strong":
+            joint_scale = np.full(29, 3.)
+            joint_scale[[20, 21, 27, 28]] = 10.
+        else:
+            joint_scale = np.r_[np.full(15, 30.), np.full(14, 80.)]
+            joint_scale[[20, 21, 27, 28]] = 500.
         A.append(dynamics[x.robot_joint_qvel] / joint_scale[:, None])
         b.append((joint_goal - constant[x.robot_joint_qvel]) / joint_scale)
         # Rolling no-slip is a soft task. Ground normal acceleration is a hard
@@ -325,6 +332,12 @@ class PreparationQP:
                        "stance_pose_constraints_in_qp_only": True,
                        "controller_joint_acceleration_trust_limits_rad_s2": joint_acceleration_limit.tolist(),
                        "controller_acceleration_bound_violation_max": acceleration_violation,
+                       "posture_priority": self.posture_priority,
+                       "joint_acceleration_task_scales_rad_s2": joint_scale.tolist(),
+                       "desired_joint_acceleration_rad_s2": joint_goal.tolist(),
+                       "predicted_joint_acceleration_rad_s2": acceleration[x.robot_joint_qvel].tolist(),
+                       "cartesian_task_acceleration_desired": np.concatenate(desired).reshape(4, 3).tolist(),
+                       "cartesian_task_acceleration_predicted": (task_j @ acceleration + task_bias).reshape(4, 3).tolist(),
                        "friction_margin_min": friction_margin, "pd_torque_reconstruction_error_max": torque_error,
                        "native_actuator_force_reconstruction_error_max": native_torque_error,
                        "active_assumed_contacts": list(map(bool, active)), "surface_names": surfaces,
@@ -342,13 +355,15 @@ def main():
     parser.add_argument("--reference", type=Path, default=Path("data/ollie/tail_contact_upright_v4/joint_reference_50hz.npz"))
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--seconds", type=float, default=0.5)
+    parser.add_argument("--posture-priority", choices=("legacy", "strong"), default="legacy",
+                        help="Single posture-task weighting change; original controller bounds remain unchanged")
     args = parser.parse_args()
     if args.out_dir.exists() or not 0 < args.seconds <= 2.76 or not np.isclose(args.seconds / 0.02, round(args.seconds / 0.02)):
         parser.error("fresh output and 20ms-aligned interval in (0,2.76] required")
     if mujoco.get_mjcb_control() is not None:
         raise RuntimeError("no global control callback allowed")
     reference = JointReference.load(args.reference)
-    controller = PreparationQP(reference)
+    controller = PreparationQP(reference, posture_priority=args.posture_priority)
     m, d, x = controller.model, controller.data, controller.index
     mujoco.mj_resetData(m, d)
     d.qpos[:], d.qvel[:] = controller.qpos[0], 0
@@ -367,12 +382,22 @@ def main():
         foot_error = (d.site_xpos[controller.feet] - d.xpos[x.board_body]) @ R - desired_feet
         row.update(robot_com_z_m=float(d.subtree_com[controller.pelvis, 2]),
                    robot_com_vz_m_s=float(d.subtree_linvel[controller.pelvis, 2]),
+                   robot_root_vz_m_s=float(d.qvel[x.robot_qvel + 2]),
+                   board_root_vz_m_s=float(d.qvel[x.board_qvel + 2]),
                    foot_gap_m=float(abs(foot_error[:, 2]).max()),
                    foot_planar_slip_m=float(np.linalg.norm(foot_error[:, :2], axis=1).max()),
                    root_board_xy_m=float(np.linalg.norm(d.qpos[x.robot_qpos:x.robot_qpos + 2]
                                                        - d.qpos[x.board_qpos:x.board_qpos + 2])),
                    root_height_error_m=float(d.qpos[x.robot_qpos + 2]
                                              - np.interp(coordinate, frames, reference.robot_state[:, 2])))
+        reference_joint = np.array([np.interp(coordinate, frames, reference.robot_state[:, 7 + j]) for j in range(29)])
+        reference_joint_velocity = np.array([np.interp(coordinate, frames, reference.robot_state[:, 42 + j]) for j in range(29)])
+        joint_error = d.qpos[x.robot_joint_qpos] - reference_joint
+        joint_velocity_error = d.qvel[x.robot_joint_qvel] - reference_joint_velocity
+        row.update(joint_position_error_rad=joint_error.tolist(),
+                   joint_velocity_error_rad_s=joint_velocity_error.tolist(),
+                   joint_position_error_rmse_rad=float(np.mean(joint_error ** 2) ** 0.5),
+                   joint_position_error_max_rad=float(abs(joint_error).max()))
         return row
 
     records, states, actions, poses, velocities, solves = [observe()], [controller.indices.pack(d.qpos, d.qvel).numpy()], [], [d.qpos.copy()], [d.qvel.copy()], []
@@ -407,6 +432,7 @@ def main():
     final = [r for r in records if r["time_physics"] >= d.time - 0.3]
     summary = {"schema": "supermimic.ollie.whole_body_qp_pilot.v1", "reference": str(args.reference.resolve()),
                "reference_sha256": hashlib.sha256(args.reference.read_bytes()).hexdigest(),
+               "posture_priority": args.posture_priority,
                "seconds": float(d.time), "requested_seconds": args.seconds, "failure": failure,
                "minimum_upright": min(r["robot_upright_cosine"] for r in records),
                "robot_ground_first_s": next((r["time_physics"] for r in records if r["unique_robot_geoms_ground"]), None),
@@ -418,6 +444,10 @@ def main():
                "maximum_root_board_xy_m": max(r["root_board_xy_m"] for r in records),
                "root_height_rmse_m": float(np.mean([r["root_height_error_m"] ** 2 for r in records]) ** 0.5),
                "root_height_max_error_m": max(abs(r["root_height_error_m"]) for r in records),
+               "joint_position_rmse_rad": float(np.mean([np.mean(np.square(r["joint_position_error_rad"])) for r in records]) ** 0.5),
+               "joint_position_max_error_rad": max(r["joint_position_error_max_rad"] for r in records),
+               "joint_position_max_error_by_joint_rad": np.max(np.abs([r["joint_position_error_rad"] for r in records]), axis=0).tolist(),
+               "joint_velocity_rmse_rad_s": float(np.mean([np.mean(np.square(r["joint_velocity_error_rad_s"])) for r in records]) ** 0.5),
                "foot_support_fraction": {side: sum(r[f"{side}_foot_deck_upward_support_n"] > 1 for r in records) / len(records) for side in ("left", "right")},
                "final_foot_support_fraction": {side: sum(r[f"{side}_foot_deck_upward_support_n"] > 1 for r in final) / len(final) for side in ("left", "right")},
                "four_wheels_ground_fraction": sum(r["unique_wheels_ground"] == 4 for r in records) / len(records),
