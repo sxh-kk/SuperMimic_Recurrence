@@ -6,6 +6,7 @@ robot's 29 position targets are supplied; the board is always passive.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import mujoco
@@ -16,8 +17,8 @@ from scipy.spatial.transform import Rotation
 
 from supermimic.ollie.physics import (
     BOARD_BODY_NAME,
+    BOARD_GEOM_NAMES,
     BOARD_JOINT_NAMES,
-    WHEEL_RADIUS,
     SceneIndex,
     contact_summary,
     make_scene_spec,
@@ -37,6 +38,101 @@ DEFAULT = np.array([0.55, 0.30, 0.70, 0.12, 0.06, 0.65, 0.32, 0.0, 0.0, 0.0, 0.3
 CONTROL_DT = 0.02
 
 
+@dataclass(frozen=True)
+class BalanceGains:
+    """Four support-feedback gains, selected by a bounded native CPU grid."""
+
+    tilt_scale: float = 1.5
+    rate_scale: float = 2.0
+    com_position_gain: float = 2.4
+    com_velocity_gain: float = 0.2
+
+    def __post_init__(self):
+        values = np.array([self.tilt_scale, self.rate_scale,
+                           self.com_position_gain, self.com_velocity_gain])
+        if not np.isfinite(values).all() or (values < 0).any():
+            raise ValueError("balance gains must be finite and nonnegative")
+
+
+class FootBoardSupport:
+    """Read resolved normal support force; never apply the measured force."""
+
+    def __init__(self, model):
+        self.model = model
+        self.deck = {model.geom(name).id for name in BOARD_GEOM_NAMES}
+        self.foot_side = {g: side for side, name in enumerate(("left", "right"))
+                          for g in range(model.ngeom) if model.geom(g).name.startswith(name + "_foot")}
+
+    def vertical_loads(self, data):
+        loads = np.zeros(2)
+        for contact_id, contact in enumerate(data.contact[:data.ncon]):
+            if contact.efc_address < 0:
+                continue
+            a, b = map(int, contact.geom)
+            side = self.foot_side.get(a) if b in self.deck else self.foot_side.get(b) if a in self.deck else None
+            if side is None:
+                continue
+            force = np.zeros(6)
+            mujoco.mj_contactForce(self.model, data, contact_id, force)
+            loads[side] += max(float(force[0]), 0) * abs(float(contact.frame[2]))
+        return loads
+
+
+@dataclass(frozen=True)
+class BoardCollisionGeometry:
+    """Exact support heights of this rigid deck and four symmetric cylinders.
+
+    Wheel hinge rotation changes neither the cylinder centre nor its symmetry
+    axis. This reduction is checked against the authored joint/geom axes.
+    It is geometry only: positive clearance does not certify a contact event.
+    """
+
+    local_centres: np.ndarray
+    local_rotations: np.ndarray
+    sizes: np.ndarray
+    wheel_count: int
+
+    @classmethod
+    def from_model(cls, model, index, qpos):
+        data = mujoco.MjData(model)
+        data.qpos[:] = qpos
+        mujoco.mj_kinematics(model, data)
+        names = [name.removesuffix("_joint") + "_collision" for name in BOARD_JOINT_NAMES]
+        geoms = [model.geom(name).id for name in names + list(BOARD_GEOM_NAMES)]
+        board_rotation = data.xmat[index.board_body].reshape(3, 3)
+        centres = (data.geom_xpos[geoms] - data.xpos[index.board_body]) @ board_rotation
+        rotations = np.einsum("ij,njk->nik", board_rotation.T,
+                              data.geom_xmat[geoms].reshape(-1, 3, 3))
+        for slot, name in enumerate(BOARD_JOINT_NAMES):
+            joint = model.joint(name).id
+            if model.geom_type[geoms[slot]] != mujoco.mjtGeom.mjGEOM_CYLINDER:
+                raise ValueError("wheel support expects cylinder collision geometry")
+            axis = board_rotation.T @ data.xaxis[joint]
+            if abs(axis @ rotations[slot, :, 2]) < 1 - 1e-8:
+                raise ValueError("wheel hinge must be parallel to its cylinder symmetry axis")
+            if not np.allclose(data.xanchor[joint], data.geom_xpos[geoms[slot]], atol=1e-10):
+                raise ValueError("wheel hinge must pass through its cylinder centre")
+        if any(model.geom_type[g] != mujoco.mjtGeom.mjGEOM_BOX for g in geoms[len(names):]):
+            raise ValueError("board support expects deck and axle boxes")
+        return cls(centres.copy(), rotations.copy(), model.geom_size[geoms].copy(), len(names))
+
+    def clearances(self, board_qpos):
+        values = np.atleast_2d(board_qpos)
+        w, x, y, z = values[:, 3:7].T
+        # Third row of the board's world rotation, for scalar-first quaternions.
+        up = np.stack((2 * (x*z - w*y), 2 * (y*z + w*x),
+                       1 - 2 * (x*x + y*y)), axis=1)
+        centre_z = values[:, 2, None] + up @ self.local_centres.T
+        directions = np.einsum("ni,gij->ngj", up, self.local_rotations)
+        extent = (np.abs(directions) * self.sizes[None]).sum(axis=2)
+        axis_z = np.clip(directions[:, :self.wheel_count, 2], -1, 1)
+        extent[:, :self.wheel_count] = (
+            self.sizes[:self.wheel_count, 0] * np.sqrt(np.maximum(0, 1 - axis_z**2))
+            + self.sizes[:self.wheel_count, 1] * np.abs(axis_z)
+        )
+        return centre_z - extent
+
+
 @dataclass
 class ControlProblem:
     model: mujoco.MjModel
@@ -50,6 +146,7 @@ class ControlProblem:
     ik_report: dict
     leg_ik_tables: tuple | None = None
     catch_priority: bool = False
+    board_geometry: BoardCollisionGeometry | None = None
 
 
 def make_control_problem(
@@ -230,8 +327,10 @@ def make_control_problem(
             "target_generation_only": True,
             "preserve_support_com_xy": balance_support_com,
         }
+    geometry = BoardCollisionGeometry.from_model(model, index, data.qpos)
     return ControlProblem(model, index, data.qpos.copy(), data.qvel.copy(),
-                          nominal, limits, slices, foot_targets, report, tables, catch_priority)
+                          nominal, limits, slices, foot_targets, report, tables, catch_priority,
+                          geometry)
 
 
 def control_trajectory(problem: ControlProblem, parameters, seconds: float = 2.2) -> np.ndarray:
@@ -311,7 +410,7 @@ def initial_state(problem):
     return state
 
 
-def balance_callback(problem: ControlProblem):
+def balance_callback(problem: ControlProblem, gains: BalanceGains | None = None):
     """50 Hz held ankle feedback; positive projected tilt corrects supported root tilt.
 
     The sign is backed by the independent +/- perturbation probe recorded in
@@ -319,10 +418,12 @@ def balance_callback(problem: ControlProblem):
     transient. This is still an untuned engineering controller, not a stable actor.
     """
     index = problem.index
+    gains = gains or BalanceGains()
     ankles = index.robot_actuators[[4, 5, 10, 11]]
     ankle_joints = problem.model.actuator_trnid[ankles, 0]
     root_body = problem.model.body("pelvis").id
-    foot_sites = [problem.model.site(f"{side}_foot").id for side in ("left", "right")]
+    support_contact = FootBoardSupport(problem.model)
+    support_offset = problem.foot_targets.mean(axis=0)
     initial_quat = problem.qpos[index.robot_qpos + 3:index.robot_qpos + 7]
     yaw = 2 * np.arctan2(initial_quat[3], initial_quat[0])
     c, s = np.cos(yaw / 2), np.sin(yaw / 2)
@@ -346,16 +447,25 @@ def balance_callback(problem: ControlProblem):
         roll = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x*x + y*y))
         pitch = np.arcsin(np.clip(2 * (w * y - z * x), -1, 1))
         angular = data.qvel[index.robot_qvel + 3:index.robot_qvel + 6]
-        velocity = data.qvel[index.robot_qvel:index.robot_qvel + 2]
-        support = data.site_xpos[foot_sites, :2].mean(axis=0)
+        loads = support_contact.vertical_loads(data)
+        if not (loads > 1.0).any():
+            cache[key] = (tick, float(data.time), np.zeros(4))
+            return
+        jacobian = np.zeros((3, model.nv))
+        mujoco.mj_jacSubtreeCom(model, data, jacobian, root_body)
+        velocity = (jacobian @ data.qvel)[:2]
+        support = (data.xpos[index.board_body]
+                   + data.xmat[index.board_body].reshape(3, 3) @ support_offset)[:2]
         com_error = data.subtree_com[root_body, :2] - support
         pitch_correction = np.clip(
-            1.4 * pitch + 0.14 * angular[1] + 1.2 * (com_error @ forward)
-            + 0.16 * (velocity @ forward), -0.35, 0.35
+            1.4 * gains.tilt_scale * pitch + 0.14 * gains.rate_scale * angular[1]
+            + gains.com_position_gain * (com_error @ forward)
+            + gains.com_velocity_gain * (velocity @ forward), -0.35, 0.35
         )
         roll_correction = np.clip(
-            0.8 * roll + 0.10 * angular[0] - 0.7 * (com_error @ lateral)
-            - 0.10 * (velocity @ lateral), -0.15, 0.15
+            0.8 * gains.tilt_scale * roll + 0.10 * gains.rate_scale * angular[0]
+            - gains.com_position_gain * (com_error @ lateral)
+            - gains.com_velocity_gain * (velocity @ lateral), -0.15, 0.15
         )
         # The rear foot is open relative to the torso. Project torso tilt onto
         # each actual world-space ankle axis instead of applying identical
@@ -363,6 +473,7 @@ def balance_callback(problem: ControlProblem):
         tilt_world = np.r_[forward * roll_correction + lateral * pitch_correction, 0.0]
         corrections = np.clip(data.xaxis[ankle_joints] @ tilt_world,
                               [-0.35, -0.15, -0.35, -0.15], [0.35, 0.15, 0.35, 0.15])
+        corrections *= np.repeat(loads > 1.0, 2)
         cache[key] = (tick, float(data.time), corrections)
         data.ctrl[ankles] += corrections
         data.ctrl[index.robot_actuators] = np.clip(
@@ -436,8 +547,8 @@ def placement_callback(problem: ControlProblem):
     return callback
 
 
-def feedback_callback(problem: ControlProblem, *, balance=False, placement=False):
-    callbacks = ([balance_callback(problem)] if balance else []) + ([placement_callback(problem)] if placement else [])
+def feedback_callback(problem: ControlProblem, *, balance=False, placement=False, balance_gains=None):
+    callbacks = ([balance_callback(problem, balance_gains)] if balance else []) + ([placement_callback(problem)] if placement else [])
     if not callbacks:
         return None
 
@@ -451,6 +562,11 @@ def feedback_callback(problem: ControlProblem, *, balance=False, placement=False
 def score_rollout(problem: ControlProblem, states, sensors) -> tuple[float, dict]:
     """Reward a bounded board jump and catch, rather than simply throwing the board."""
     model, index = problem.model, problem.index
+    if (not np.isfinite(states).all() or not np.isfinite(sensors).all()
+            or not np.all(np.diff(states[:, 0]) > 0)):
+        return -1000.0, {"score": -1000.0, "catch_search_eligible": False,
+                         "numerical_failure": "nonfinite state/sensor or nonmonotonic time"}
+    sample_dt = float(np.median(np.diff(states[:, 0]))) if len(states) > 1 else CONTROL_DT
     q = states[:, 1:1 + model.nq]
     board_pos = q[:, index.board_qpos:index.board_qpos + 3]
     robot_pos = q[:, index.robot_qpos:index.robot_qpos + 3]
@@ -459,24 +575,26 @@ def score_rollout(problem: ControlProblem, states, sensors) -> tuple[float, dict
     board_quat = q[:, index.board_qpos + 3:index.board_qpos + 7]
     board_upright = 1 - 2 * (board_quat[:, 1]**2 + board_quat[:, 2]**2)
     min_board_upright = float(board_upright.min())
-    wheel_height = np.stack([
-        sensors[:, problem.sensor_slices[f"{name.removesuffix('_joint')}_world"]][:, 2]
-        for name in BOARD_JOINT_NAMES
-    ], axis=1) - WHEEL_RADIUS
+    geometry = problem.board_geometry or BoardCollisionGeometry.from_model(model, index, problem.qpos)
+    collision_heights = geometry.clearances(q[:, index.board_qpos:index.board_qpos + 7])
+    wheel_height = collision_heights[:, :geometry.wheel_count]
     minimum_wheel_height = wheel_height.min(axis=1)
+    minimum_board_height = collision_heights.min(axis=1)
     left = sensors[:, problem.sensor_slices["left_foot_board"]]
     right = sensors[:, problem.sensor_slices["right_foot_board"]]
     feet = np.stack([left, right], axis=1)
-    final = slice(-max(round(0.25 / model.opt.timestep), 1), None)
+    final = slice(-max(round(0.25 / sample_dt), 1), None)
     foot_error = np.linalg.norm(feet[:, :, :2] - problem.foot_targets[:, :2], axis=2)
     height_error = np.abs(feet[:, :, 2] - problem.foot_targets[:, 2])
     landing_error = float(np.mean(foot_error[final]) + np.mean(height_error[final]))
     board_escape = float(np.max(np.linalg.norm(board_pos[:, :2] - robot_pos[:, :2], axis=1)))
     clearance = float(max(minimum_wheel_height.max(), 0))
-    airborne_seconds = float(np.count_nonzero(minimum_wheel_height > 0.005) * model.opt.timestep)
+    edges = np.diff(np.r_[False, minimum_board_height > 0.005, False].astype(np.int8))
+    windows = np.flatnonzero(edges == -1) - np.flatnonzero(edges == 1)
+    geometric_air_seconds = float(windows.max(initial=0) * sample_dt)
     root_peak = float(robot_pos[:, 2].max() - problem.qpos[index.robot_qpos + 2])
-    crouch_end = max(1, round(0.42 / model.opt.timestep))
-    takeoff_end = max(crouch_end + 1, round(1.0 / model.opt.timestep))
+    crouch_end = max(1, round(0.42 / sample_dt))
+    takeoff_end = max(crouch_end + 1, round(1.0 / sample_dt))
     crouch_height = float(robot_pos[:crouch_end, 2].min())
     extension_rise = float(max(robot_pos[crouch_end:takeoff_end, 2].max() - crouch_height, 0))
     # A nose-up board is a dense stepping stone; it does not count as a completed pop.
@@ -485,11 +603,10 @@ def score_rollout(problem: ControlProblem, states, sensors) -> tuple[float, dict
     nose_rise = float(max((front_height - rear_height).max(), 0))
     tail_tip_height = float(sensors[crouch_end:takeoff_end, problem.sensor_slices["tail_tip_world"]][:, 2].min())
     tail_approach = float(np.clip((0.060 - tail_tip_height) / 0.055, 0, 1))
-    # Wheel lift while balancing on the tail is not board flight. The tip-site
-    # lower bound is only a dense search proxy; final success uses actual contacts.
-    tail_tip = sensors[:, problem.sensor_slices["tail_tip_world"]][:, 2]
-    flight_end = min(len(states), round(1.35 / model.opt.timestep))
-    board_clearance_proxy = float(max(np.minimum(minimum_wheel_height, tail_tip - 0.009)[crouch_end:flight_end].max(), 0))
+    # Include all deck/axle box corners and oriented wheel cylinder extents.
+    # Actual contact-free flight is certified separately at every physics step.
+    flight_end = min(len(states), round(1.35 / sample_dt))
+    board_clearance = float(max(minimum_board_height[crouch_end:flight_end].max(), 0))
     min_upright = float(upright.min())
     upward_speed = float(max(states[crouch_end:takeoff_end, 1 + model.nq + index.robot_qvel + 2].max(), 0))
     final_root_height = float(robot_pos[final, 2].mean())
@@ -498,8 +615,8 @@ def score_rollout(problem: ControlProblem, states, sensors) -> tuple[float, dict
                          np.clip((min_board_upright - 0.4) / 0.35, 0, 1)))
     pop_gate = float(np.clip((0.030 - tail_tip_height) / 0.020, 0, 1))
     score = (
-        survival * (20 * min(clearance, 0.25) + 2 * min(airborne_seconds, 0.45)
-                    + 40 * min(board_clearance_proxy, 0.15) * pop_gate)
+        survival * (20 * min(clearance, 0.25) + 2 * min(geometric_air_seconds, 0.45)
+                    + 40 * min(board_clearance, 0.15) * pop_gate)
         + 2 * min(max(root_peak, 0), 0.35) - 5 * landing_error
         + 3 * min(extension_rise, 0.30) + 2 * min(nose_rise, 0.20)
         + 0.6 * min(upward_speed, 2.0)
@@ -508,10 +625,10 @@ def score_rollout(problem: ControlProblem, states, sensors) -> tuple[float, dict
         - 3 * max(0.60 - final_root_height, 0)
         - 4 * max(0.70 - min_board_upright, 0)
     )
-    catch_eligible = board_clearance_proxy >= 0.008 and pop_gate >= 0.8 and survival >= 0.85
+    catch_eligible = board_clearance >= 0.008 and pop_gate >= 0.8 and survival >= 0.85
     if problem.catch_priority:
-        # Second-stage search retains genuine early board-release candidates,
-        # then minimizes missed catches instead of returning to a grounded squat.
+        # This is only a geometric search gate; actual contacts and continuous
+        # flight are audited in the final, full-resolution native rollout.
         vector = 2 * np.cross(board_quat[:, None, 1:], feet)
         feet_world = (board_pos[:, None] + feet + board_quat[:, None, :1] * vector
                       + np.cross(board_quat[:, None, 1:], vector))
@@ -519,11 +636,9 @@ def score_rollout(problem: ControlProblem, states, sensors) -> tuple[float, dict
         score = ((100.0 if catch_eligible else -100.0) + 2 * min(extension_rise, 0.25)
                  - 20 * landing_error - 8 * floor_proxy
                  - 4 * max(board_escape - 0.25, 0) - 4 * max(0.8 - min_upright, 0))
-    if not np.isfinite(states).all() or not np.all(np.diff(states[:, 0]) > 0):
-        score = -1000.0
     return score, {
         "score": float(score), "maximum_all_wheel_clearance_m": clearance,
-        "all_wheels_airborne_seconds": airborne_seconds,
+        "whole_board_geometric_clearance_above_5mm_longest_s": geometric_air_seconds,
         "robot_root_rise_m": root_peak, "minimum_upright_cosine": min_upright,
         "minimum_board_upright_cosine": min_board_upright,
         "landing_foot_error_m": landing_error, "maximum_board_robot_xy_distance_m": board_escape,
@@ -532,23 +647,81 @@ def score_rollout(problem: ControlProblem, states, sensors) -> tuple[float, dict
         "maximum_nose_above_rear_wheels_m": nose_rise,
         "maximum_pop_root_upward_speed_mps": upward_speed,
         "minimum_pop_tail_tip_height_m": tail_tip_height,
-        "maximum_board_clearance_proxy_m": board_clearance_proxy,
+        "maximum_whole_board_clearance_m": float(minimum_board_height.max()),
+        "maximum_early_whole_board_clearance_m": board_clearance,
+        "search_metrics_certify_contact_free_flight": False,
         "survival_reward_gate": survival,
         "catch_search_eligible": bool(catch_eligible),
+        "search_observation_dt": sample_dt,
     }
 
 
-def evaluate_batch(problem, parameters, *, seconds=2.2, threads=4, balance=False, placement=False):
-    controls = np.stack([control_trajectory(problem, p, seconds) for p in parameters])
-    start = initial_state(problem)[None]
+def feedback_rollout(problem, parameters, *, seconds=2.2, balance=False, placement=False, balance_gains=None):
+    """Continuous simulation with feedback sampled after resolved constraints.
+
+    This deliberately does not use mjcb_control: that callback precedes the
+    current constraint solve, so current contacts and previous forces can differ.
+    The caller must leave the global control callback unset.
+    """
+    model, index = problem.model, problem.index
+    data = mujoco.MjData(model)
+    data.qpos[:], data.qvel[:] = problem.qpos, problem.qvel
+    mujoco.mj_forward(model, data)
+    callback = feedback_callback(problem, balance=balance, placement=placement, balance_gains=balance_gains)
+    substeps = round(CONTROL_DT / model.opt.timestep)
+    nominal = control_trajectory(problem, parameters, seconds)[::substeps]
+    state_size = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+    states, sensors, actual_controls = [], [], []
+    for target in nominal:
+        data.ctrl[:] = target
+        if callback:
+            callback(model, data)
+        actual_controls.append(data.ctrl[index.robot_actuators].copy())
+        mujoco.mj_step(model, data, nstep=substeps)
+        mujoco.mj_forward(model, data)
+        state = np.empty(state_size)
+        mujoco.mj_getState(model, data, state, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+        states.append(state)
+        sensors.append(data.sensordata.copy())
+    return np.asarray(states), np.asarray(sensors), np.asarray(actual_controls)
+
+
+def evaluate_batch(problem, parameters, *, seconds=2.2, threads=4, balance=False, placement=False, balance_gains=None):
     previous = mujoco.get_mjcb_control()
     try:
+        mujoco.set_mjcb_control(None)
         if balance or placement:
-            mujoco.set_mjcb_control(feedback_callback(problem, balance=balance, placement=placement))
+            def evaluate_one(parameters):
+                state, sensor, _ = feedback_rollout(
+                    problem, parameters, seconds=seconds, balance=balance, placement=placement,
+                    balance_gains=balance_gains,
+                )
+                return score_rollout(problem, state, sensor)
+
+            with ThreadPoolExecutor(max_workers=threads) as executor:
+                return list(executor.map(evaluate_one, parameters))
+        controls = np.stack([control_trajectory(problem, p, seconds) for p in parameters])
+        start = initial_state(problem)[None]
         states, sensors = rollout.rollout(
             problem.model, [mujoco.MjData(problem.model) for _ in range(threads)],
             start, controls, persistent_pool=True,
         )
+        # mj_step integrates qpos/qvel after evaluating position sensors. Thus
+        # native rollout's next sensor sample belongs to the preceding state.
+        # Our sensors are all FramePos; shift those samples and refresh the final
+        # endpoint once so search and the physically recorded candidate agree.
+        aligned = sensors.copy()
+        for episode, state in enumerate(states):
+            if not np.isfinite(state).all() or not np.all(np.diff(state[:, 0]) > 0):
+                continue
+            final_data = mujoco.MjData(problem.model)
+            final_data.qpos[:] = state[-1, 1:1 + problem.model.nq]
+            final_data.qvel[:] = state[-1, 1 + problem.model.nq:1 + problem.model.nq + problem.model.nv]
+            mujoco.mj_forward(problem.model, final_data)
+            for sensor_slice in problem.sensor_slices.values():
+                aligned[episode, :-1, sensor_slice] = sensors[episode, 1:, sensor_slice]
+                aligned[episode, -1, sensor_slice] = final_data.sensordata[sensor_slice]
+        sensors = aligned
     finally:
         mujoco.set_mjcb_control(previous)
     return [score_rollout(problem, state, sensor)

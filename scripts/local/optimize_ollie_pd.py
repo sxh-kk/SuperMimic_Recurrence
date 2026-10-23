@@ -7,15 +7,18 @@ import csv
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import mujoco
 import numpy as np
 from mujoco import rollout
 
+from scripts.local.evaluate_ollie_policy import PHYSICS_DT, ContactObserver, outcome
 from supermimic.data.motion_convert import G1_JOINT_NAMES
 from supermimic.ollie.control import (
     CONTROL_DT,
@@ -23,6 +26,8 @@ from supermimic.ollie.control import (
     LOWER,
     PARAMETER_NAMES,
     UPPER,
+    BalanceGains,
+    FootBoardSupport,
     control_trajectory,
     evaluate_batch,
     feedback_callback,
@@ -30,13 +35,15 @@ from supermimic.ollie.control import (
     make_control_problem,
     score_rollout,
 )
-from supermimic.ollie.physics import BOARD_JOINT_NAMES, WHEEL_RADIUS, contact_summary
+from supermimic.ollie.physics import BOARD_JOINT_NAMES, contact_summary
 from supermimic.ollie.state import JointStateIndices
 
 
-def save_candidate(problem, parameters, out_dir, *, seconds, balance, render, placement=False):
+def save_candidate(problem, parameters, out_dir, *, seconds, balance, render, placement=False, balance_gains=None):
     """One uninterrupted native simulation; qpos/qvel are written only at reset."""
     model, index = problem.model, problem.index
+    if not np.isclose(model.opt.timestep, PHYSICS_DT):
+        raise ValueError("Shared continuous-flight certification currently requires 2.5 ms physics")
     data = mujoco.MjData(model)
     data.qpos[:], data.qvel[:] = problem.qpos, problem.qvel
     mujoco.mj_forward(model, data)
@@ -45,7 +52,10 @@ def save_candidate(problem, parameters, out_dir, *, seconds, balance, render, pl
     states, sensors, qpos, qvel, records = [], [], [data.qpos.copy()], [data.qvel.copy()], []
     executed_controls = []
     substeps = round(CONTROL_DT / model.opt.timestep)
-    callback = feedback_callback(problem, balance=balance, placement=placement)
+    callback = feedback_callback(problem, balance=balance, placement=placement, balance_gains=balance_gains)
+    support_contact = FootBoardSupport(model)
+    observer = ContactObserver(model, index, 0.1)
+    physical_records = [observer.observe(data)]
     previous = mujoco.get_mjcb_control()
     try:
         mujoco.set_mjcb_control(None)
@@ -66,79 +76,58 @@ def save_candidate(problem, parameters, out_dir, *, seconds, balance, render, pl
             qpos.append(data.qpos.copy())
             qvel.append(data.qvel.copy())
             contacts = contact_summary(model, data)
-            foot_touch = {f"{side}_foot_board": False for side in ("left", "right")}
-            ground_contacts = {"board_ground": 0, "robot_ground": 0}
-            wheel_touch = {name.removesuffix("_joint") + "_ground": False for name in BOARD_JOINT_NAMES}
-            for contact in data.contact[:data.ncon]:
-                names = [model.geom(int(gid)).name for gid in contact.geom]
-                if "ground" in names:
-                    is_board = any(name.startswith(("board_", "wheel_")) for name in names)
-                    ground_contacts["board_ground" if is_board else "robot_ground"] += 1
-                    for wheel in BOARD_JOINT_NAMES:
-                        body = wheel.removesuffix("_joint")
-                        if f"{body}_collision" in names:
-                            wheel_touch[f"{body}_ground"] = True
-                if any(name.startswith("board_") for name in names):
-                    for side in ("left", "right"):
-                        if any(name.startswith(f"{side}_foot") for name in names):
-                            foot_touch[f"{side}_foot_board"] = True
-            wheel_z = [data.sensordata[problem.sensor_slices[
-                name.removesuffix("_joint") + "_world"]][2] - WHEEL_RADIUS
-                for name in BOARD_JOINT_NAMES]
+            support_loads = support_contact.vertical_loads(data)
+            physical = observer.observe(data)
+            physical_records.append(physical)
             mujoco.mj_energyPos(model, data)
             mujoco.mj_energyVel(model, data)
             records.append({
                 "time_s": float(data.time), "board_z_m": float(data.qpos[index.board_qpos + 2]),
                 "robot_z_m": float(data.qpos[index.robot_qpos + 2]),
-                "minimum_wheel_clearance_m": float(min(wheel_z)),
                 "potential_energy_j": float(data.energy[0]), "kinetic_energy_j": float(data.energy[1]),
-                "maximum_abs_actuator_force_nm": float(abs(data.actuator_force).max()),
-                "external_generalized_force_norm": float(np.linalg.norm(data.qfrc_applied)),
-                "external_body_force_norm": float(np.linalg.norm(data.xfrc_applied)),
-                **contacts,
-                **foot_touch,
-                **ground_contacts,
-                **wheel_touch,
+                **{f"broadphase_{name}": value for name, value in contacts.items()},
+                **physical,
+                "left_deck_vertical_load_n": float(support_loads[0]),
+                "right_deck_vertical_load_n": float(support_loads[1]),
             })
     finally:
         mujoco.set_mjcb_control(previous)
     states, sensors, qpos, qvel = np.array(states), np.array(sensors), np.array(qpos), np.array(qvel)
     executed_controls = np.array(executed_controls)
     _, metrics = score_rollout(problem, states, sensors)
-    has_tail_contact = any(r["tail_ground"] > 0 for r in records)
-    airborne = [i for i, r in enumerate(records)
-                if r["minimum_wheel_clearance_m"] > 0.005 and r["board_ground"] == 0]
-    tail_before_air = bool(airborne) and any(
-        r["tail_ground"] > 0 for r in records[:airborne[0] + 1]
+    numerical_failure = None
+    if not all(np.isfinite(value).all() for value in (states, sensors, qpos, qvel, executed_controls)):
+        numerical_failure = "nonfinite native state, sensor or actual control"
+    elif not np.allclose(states[:, 0], (np.arange(len(states)) + 1) * model.opt.timestep,
+                         rtol=0, atol=1e-8):
+        numerical_failure = "physical timeline reset or discontinuity"
+    certification = outcome(physical_records, full_reference=True, numerical_failure=numerical_failure)
+    # This baseline has no video-reference objective. The shared criterion means
+    # only that the requested uninterrupted native episode was fully simulated.
+    certification["criteria"]["full_requested_baseline_episode"] = certification["criteria"].pop("full_reference_episode")
+    certification["criteria"]["board_flight_clearance_at_least_15mm"] = (
+        certification["maximum_whole_board_clearance_m"] >= 0.015
     )
-    final_window = records[-round(0.15 / model.opt.timestep):]
-    landed_on_wheels = all(all(r[name.removesuffix("_joint") + "_ground"]
-                               for name in BOARD_JOINT_NAMES) for r in final_window)
-    caught = all(np.mean([r[f"{side}_foot_board"] for r in final_window]) >= 0.8
-                 for side in ("left", "right"))
-    completed = (
-        tail_before_air and metrics["maximum_all_wheel_clearance_m"] >= 0.015
-        and metrics["all_wheels_airborne_seconds"] >= 0.04
-        and len(airborne) * model.opt.timestep >= 0.04
-        and metrics["minimum_upright_cosine"] > 0.7
-        and metrics["minimum_board_upright_cosine"] > 0.65
-        and metrics["landing_foot_error_m"] < 0.12
-        and metrics["final_robot_root_height_m"] > 0.6 and caught and landed_on_wheels
-        and not any(r["robot_ground"] > 0 for r in records)
-        and max(r["maximum_penetration_m"] for r in records) <= 0.01
-    )
+    certification["failure_reasons"] = [name for name, passed in certification["criteria"].items() if not passed]
+    completed = not certification["failure_reasons"]
+    certification["success"] = completed
+    certification["outcome"] = "SUCCESS" if completed else "FAILED"
+    metrics.update(certification)
     metrics.update(
-        completed_feasibility_sequence=bool(completed), tail_contact=has_tail_contact,
-        tail_before_air=bool(tail_before_air), final_wheels_ground=bool(landed_on_wheels),
-        final_foot_board_contact=bool(caught),
-        board_free_airborne_seconds=len(airborne) * model.opt.timestep,
-        robot_ground_contact=any(r["robot_ground"] > 0 for r in records),
-        peak_penetration_m=max(r["maximum_penetration_m"] for r in records),
+        completed_feasibility_sequence=bool(completed),
+        tail_contact=any(row["tail_ground"] for row in physical_records),
+        longest_continuous_whole_board_flight_s=max(
+            (window["duration_s"] for window in certification["flight_windows"]), default=0.0),
+        whole_board_contact_free_flight_total_s=sum(
+            window["duration_s"] for window in certification["flight_windows"]),
+        robot_ground_contact=any(row["unique_robot_geoms_ground"] for row in physical_records),
+        peak_penetration_m=certification["maximum_penetration_m"],
         no_board_actuators=True, no_external_forces=all(
             r["external_generalized_force_norm"] == r["external_body_force_norm"] == 0
             for r in records
         ),
-        outcome="completed baseline sequence" if completed else "not completed",
+        physical_contact_normal_force_threshold_n=0.1,
+        verification_observation_dt=model.opt.timestep,
         disclaimer="PD physical feasibility baseline, not SuperMimic or video-matching result",
     )
     np.savez_compressed(out_dir / "best_rollout.npz", qpos=qpos, state=states,
@@ -166,6 +155,10 @@ def save_candidate(problem, parameters, out_dir, *, seconds, balance, render, pl
         writer = csv.DictWriter(stream, fieldnames=list(records[0]))
         writer.writeheader()
         writer.writerows(records)
+    with (out_dir / "physical_contacts.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(physical_records[0]))
+        writer.writeheader()
+        writer.writerows(physical_records)
     if render:
         model.vis.global_.offwidth, model.vis.global_.offheight = 800, 600
         camera = mujoco.MjvCamera()
@@ -259,6 +252,8 @@ def main():
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--balance", action="store_true")
+    parser.add_argument("--balance-gains", nargs=4, type=float, metavar=("TILT", "RATE", "COM_POS", "COM_VEL"),
+                        default=[1.5, 2.0, 2.4, 0.2])
     parser.add_argument("--placement", action="store_true")
     parser.add_argument("--rear-x", type=float, default=-0.23)
     parser.add_argument("--front-x", type=float, default=0.22)
@@ -272,6 +267,10 @@ def main():
     parser.add_argument("--balance-support-com", action="store_true")
     parser.add_argument("--no-render", action="store_true")
     args = parser.parse_args()
+    try:
+        balance_gains = BalanceGains(*args.balance_gains)
+    except ValueError as error:
+        parser.error(str(error))
     if min(args.population, args.generations, args.threads) < 1 or args.seconds < 2:
         parser.error("population/generations/threads must be positive and seconds >= 2")
     if not np.isclose(args.seconds / CONTROL_DT, round(args.seconds / CONTROL_DT)):
@@ -302,7 +301,8 @@ def main():
         parameters[-exploration:] = generator.uniform(LOWER, UPPER, (exploration, len(DEFAULT)))
         parameters[0] = best
         evaluations = evaluate_batch(problem, parameters, seconds=args.seconds,
-                                     threads=args.threads, balance=args.balance, placement=args.placement)
+                                     threads=args.threads, balance=args.balance, placement=args.placement,
+                                     balance_gains=balance_gains)
         scores = np.array([value[0] for value in evaluations])
         elite = np.argsort(scores)[-max(2, args.population // 4):]
         if args.catch_priority:
@@ -322,6 +322,7 @@ def main():
                     "parameters": dict(zip(PARAMETER_NAMES, best.tolist(), strict=True)),
                     "best_search_score": best_score, "balance_feedback": args.balance,
                     "foot_placement_feedback": args.placement,
+                    "balance_gains": vars(balance_gains),
                     "catch_priority": args.catch_priority,
                     "ik": problem.ik_report, "history": history}
         (out_dir / "search.json").write_text(json.dumps(snapshot, indent=2) + "\n")
@@ -329,7 +330,8 @@ def main():
         if time.monotonic() - started >= args.max_seconds:
             break
     metrics = save_candidate(problem, best, out_dir, seconds=args.seconds,
-                             balance=args.balance, placement=args.placement, render=not args.no_render)
+                             balance=args.balance, placement=args.placement, render=not args.no_render,
+                             balance_gains=balance_gains)
     if not args.balance and not args.placement and args.dataset_episodes > 0:
         extra = generator.uniform(LOWER, UPPER, (args.dataset_episodes, len(DEFAULT)))
         extra[:args.dataset_episodes // 2] = np.clip(generator.normal(
