@@ -76,6 +76,8 @@ def main():
         indices = teacher["reference_goal_indices"].copy()
         times = teacher["time_s"].copy()
         teacher_metrics = json.loads(str(teacher["metadata_json"].item()))
+    if teacher_metrics.get("teacher_kind") == "native_sampling_mpc" and args.dagger_rounds > 0:
+        raise ValueError("native_sampling_mpc teacher cannot use the legacy static-controller DAgger expert")
     if (not all(teacher_metrics.get("gates", {}).values())
             or not teacher_metrics.get("gates")
             or teacher_metrics.get("initializations") != 1
