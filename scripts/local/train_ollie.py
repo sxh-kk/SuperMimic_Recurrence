@@ -8,6 +8,7 @@ an engineering full-state joint extension, not paper-exact SuperMimic sensing.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import math
@@ -16,6 +17,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import mujoco
+import numpy as np
 import torch
 
 from supermimic.data.motion_convert import G1_JOINT_NAMES
@@ -60,6 +62,8 @@ def main():
     parser.add_argument("--wm-init", type=Path)
     parser.add_argument("--warm-start-bias", type=Path)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--teacher-anchor", type=Path)
+    parser.add_argument("--teacher-weight", type=float, default=10.0)
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--collect-steps", type=int, default=48)
@@ -84,6 +88,8 @@ def main():
     args = parser.parse_args()
     if not math.isfinite(args.reference_max_penetration) or args.reference_max_penetration < 0:
         parser.error("reference penetration threshold must be finite and nonnegative")
+    if not math.isfinite(args.teacher_weight) or args.teacher_weight < 0:
+        parser.error("teacher anchor weight must be finite and nonnegative")
     if (args.num_envs < 8 or args.iterations < 1 or args.model_window < 1
             or args.collect_steps < args.model_window or args.horizon < 1
             or args.batch_size < 1 or args.eval_every < 1 or args.replay_chunks < 1):
@@ -119,6 +125,8 @@ def main():
     wm_opt = torch.optim.Adam(model.parameters(), lr=cfg.model_lr)
     actor_opt = torch.optim.Adam(policy.parameters(), lr=cfg.policy_lr)
     actor_updates_done = 0
+    bc_updates_done = 0
+    policy_initialization = "reference_pd"
     if args.warm_start_bias:
         if args.resume:
             raise ValueError("choose resume or initial fixed bias, not both")
@@ -140,6 +148,9 @@ def main():
         initial = torch.load(args.resume, map_location=args.device, weights_only=False)
         if initial["schema"] != "supermimic.ollie.actor.v1":
             raise ValueError("unsupported actor checkpoint")
+        if (initial.get("reference_sha256") is not None
+                and initial["reference_sha256"] != hashlib.sha256(args.reference.read_bytes()).hexdigest()):
+            raise ValueError("resume checkpoint and reference hashes differ")
         if asdict(JointLearningConfig(**initial["learning_config"])) != asdict(cfg):
             raise ValueError("resume learning configuration differs")
         model.load_state_dict(initial["model"])
@@ -147,6 +158,28 @@ def main():
         wm_opt.load_state_dict(initial["model_optimizer"])
         actor_opt.load_state_dict(initial["policy_optimizer"])
         actor_updates_done = initial.get("policy_updates_completed", 0)
+        bc_updates_done = initial.get("behavior_cloning_updates_completed", 0)
+        policy_initialization = initial.get("policy_initialization", "resumed_policy")
+    anchor = None
+    if args.teacher_anchor:
+        with np.load(args.teacher_anchor, allow_pickle=False) as teacher:
+            if (not bool(teacher["verified_teacher"].item())
+                    or str(teacher["reference_sha256"].item())
+                    != hashlib.sha256(args.reference.read_bytes()).hexdigest()
+                    or tuple(teacher["joint_names"].tolist()) != G1_JOINT_NAMES
+                    or tuple(teacher["board_joint_names"].tolist()) != env.layout.board_joint_names
+                    or tuple(teacher["reference_offsets"].tolist()) != cfg.reference_offsets):
+                raise ValueError("teacher must be verified and match the reference/joint/goal contracts")
+            anchor = tuple(torch.as_tensor(teacher[name].copy(), dtype=torch.float32, device=args.device)
+                           for name in ("state", "future_goals", "action"))
+        anchor_state, anchor_goals, anchor_action = anchor
+        if (anchor_state.shape != (len(anchor_action), env.layout.state_dim)
+                or anchor_goals.shape != (len(anchor_action), len(cfg.reference_offsets), env.layout.state_dim)
+                or anchor_action.shape != (len(anchor_state), 29)
+                or not all(torch.isfinite(value).all() for value in anchor)):
+            raise ValueError("invalid teacher anchor tensors")
+        if ((anchor_action - anchor_goals[:, 0, 7:36]).abs() >= policy.residual_limits).any():
+            raise ValueError("teacher anchor exceeds policy residual limits; choose explicit wider bounds")
     offsets = torch.tensor(cfg.reference_offsets, device=args.device)
     lower = env.joint_limits[:, 0] + 0.005
     upper = env.joint_limits[:, 1] - 0.005
@@ -235,7 +268,10 @@ def main():
                     "environment_config": asdict(env_cfg),
                     "board_joint_names": env.layout.board_joint_names,
                     "reference": str(args.reference.resolve()), "iteration": iteration,
+                    "reference_sha256": hashlib.sha256(args.reference.read_bytes()).hexdigest(),
                     "policy_updates_completed": actor_updates_done,
+                    "behavior_cloning_updates_completed": bc_updates_done,
+                    "policy_initialization": policy_initialization,
                     "training_arguments": {key: str(value) if isinstance(value, Path) else value
                                            for key, value in vars(args).items()},
                     "seed": args.seed, "observations": "full simulator state engineering prototype",
@@ -304,6 +340,7 @@ def main():
         # remain live through the complete imagined trajectory.
         model.eval().requires_grad_(False)
         actor_loss = refs.new_zeros(())
+        anchor_loss = refs.new_zeros(())
         actor_gradient = refs.new_zeros(())
         updates_this_iteration = 0 if iteration <= args.model_warmup_iterations else args.policy_updates
         for _ in range(updates_this_iteration):
@@ -325,6 +362,11 @@ def main():
                     loss.mean() + stability + 0.1 * residual.square().mean() + 0.02 * rate.square().mean())
                 previous = action
             actor_loss = actor_loss / args.horizon
+            if anchor is not None:
+                anchor_ids = torch.randint(len(anchor_action), (args.batch_size,), device=args.device)
+                anchor_prediction = policy(anchor_state[anchor_ids], anchor_goals[anchor_ids])
+                anchor_loss = (anchor_prediction - anchor_action[anchor_ids]).square().mean()
+                actor_loss = actor_loss + args.teacher_weight * anchor_loss
             actor_opt.zero_grad(set_to_none=True)
             if not torch.isfinite(actor_loss):
                 raise RuntimeError("nonfinite actor loss")
@@ -339,6 +381,7 @@ def main():
                "world_model_loss": float(wm_loss.detach()), "heldout_model_loss": float(validation),
                **{key: float(value) for key, value in validation_details.items()},
                "actor_loss": float(actor_loss.detach()), "actor_gradient": float(actor_gradient)}
+        row["teacher_anchor_loss"] = float(anchor_loss.detach())
         row["policy_updates_completed"] = actor_updates_done
         if iteration % args.eval_every == 0 or iteration == args.iterations:
             real = real_evaluate(iteration)
