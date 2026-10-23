@@ -114,12 +114,17 @@ def bind_worker(pid: int, launch_path: Path) -> tuple[dict, int]:
 def capture_children(identity: dict, tracked: dict) -> None:
     if not still_alive(identity):
         return
-    try:
-        pids = Path(f"/proc/{identity['pid']}/task/{identity['pid']}/children").read_text()
-    except FileNotFoundError:
+    # Linux lists children per spawning thread; uv may spawn from a worker thread.
+    pids: set[int] = set()
+    for children in Path(f"/proc/{identity['pid']}/task").glob("*/children"):
+        try:
+            pids.update(int(text) for text in children.read_text().split())
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # A thread may exit while its proc entry is being inspected.
+    if not still_alive(identity):
         return
-    for text in pids.split():
-        child = process_identity(int(text))
+    for pid in sorted(pids):
+        child = process_identity(pid)
         if child and child["parent_pid"] == identity["pid"]:
             tracked[(child["pid"], child["starttime_ticks"])] = child
 
