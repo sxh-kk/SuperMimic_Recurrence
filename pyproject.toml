@@ -8,10 +8,10 @@ dependencies = [
   # Base framework, pinned to the exact commit the plan was written against (main, 2026-10-18).
   "mjlab",
   # Declared directly so that our [tool.uv.sources] below apply (mjlab's own sources do not propagate).
-  "torch>=2.14.0",
-  "warp-lang>=1.15.0",
-  "mujoco-warp~=3.16.0",
-  "mujoco~=3.16.0",
+  "torch==2.14.1",
+  "warp-lang==1.18.0+cu12",
+  "mujoco-warp==3.16.0",
+  "mujoco==3.16.0",
   "numpy",
   "scipy>=1.15",
   "tensorboard>=2.20.0",
@@ -41,20 +41,19 @@ packages = ["src/supermimic"]
 
 [tool.uv.sources]
 mjlab = { git = "https://github.com/mujocolab/mjlab", rev = "8bb2bc9e187797689ec82c78c35019afd2fd0376" }
-torch = { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" }
-warp-lang = { index = "nvidia", marker = "sys_platform != 'darwin'" }
+torch = { index = "pytorch-cu126" }
+warp-lang = { url = "https://github.com/NVIDIA/warp/releases/download/v1.18.0/warp_lang-1.18.0%2Bcu12-py3-none-manylinux_2_28_x86_64.whl" }
+
+[tool.uv]
+# This lock targets the local CUDA 12 workstation, including its native wheels.
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 
 [[tool.uv.index]]
 url = "https://pypi.org/simple"
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
-
-[[tool.uv.index]]
-name = "nvidia"
-url = "https://pypi.nvidia.com/"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [tool.pytest.ini_options]
