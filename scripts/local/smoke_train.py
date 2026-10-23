@@ -17,6 +17,7 @@ from supermimic.data.motion_convert import convert_csv_to_npz, load_g1_model
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compile", action="store_true", help="also validate Torch compilation")
+    parser.add_argument("--full-size", action="store_true", help="use the standard networks, 4096 environments/rollouts and H=32")
     parser.add_argument("--steps", type=int, default=48)
     parser.add_argument("--anchor-obs", action="store_true")
     args = parser.parse_args()
@@ -42,25 +43,25 @@ def main() -> None:
 
         cfg = TrainConfig(run_name="synthetic-smoke", log_root=root / "logs", seed=0)
         cfg.data.npz_dir = root / "npz"
-        cfg.env.num_envs = 16
-        cfg.env.replay_capacity = 64
+        cfg.env.num_envs = 4096 if args.full_size else 16
+        cfg.env.replay_capacity = 1000 if args.full_size else 64
         cfg.env.obs_noise = False
         cfg.env.reset_noise = False
         cfg.env.domain_randomization = False
         cfg.env.sampling_mode = "start"
         cfg.env.anchor_obs = args.anchor_obs
         cfg.policy_trainer.obs_noise = False
-        cfg.world_model.hidden = (128, 128)
-        cfg.policy.encoder_hidden = (128, 64)
-        cfg.policy.decoder_hidden = (128, 64)
-        cfg.critic.hidden = (64, 32)
-        cfg.wm_trainer.window = 8
-        cfg.wm_trainer.batch_size = 32
-        cfg.wm_trainer.batches_per_update = 1
-        cfg.policy_trainer.batch_size = 16
-        cfg.policy_trainer.horizon = 8
-        cfg.policy_trainer.critic_epochs = 1
-        cfg.policy_trainer.critic_minibatches = 2
+        if not args.full_size:
+            cfg.world_model.hidden = (128, 128)
+            cfg.policy.encoder_hidden = (128, 64)
+            cfg.policy.decoder_hidden = (128, 64)
+            cfg.critic.hidden = (64, 32)
+            cfg.wm_trainer.batch_size = 32
+            cfg.wm_trainer.batches_per_update = 1
+            cfg.policy_trainer.batch_size = 16
+            cfg.policy_trainer.horizon = 8
+            cfg.policy_trainer.critic_epochs = 1
+            cfg.policy_trainer.critic_minibatches = 2
         mode = "default" if args.compile else None
         cfg.wm_trainer.compile = mode
         cfg.policy_trainer.compile = mode
@@ -88,6 +89,10 @@ def main() -> None:
             state = trainer.recorder.state_io.read()
             if not torch.isfinite(state).all():
                 raise RuntimeError("Simulator state contains non-finite values.")
+            with torch.no_grad():
+                errors = trainer.wm_trainer.online_error(trainer.buffer, n=32, k=8)
+            if not torch.isfinite(errors).all():
+                raise RuntimeError("World-model open-loop predictions contain non-finite errors.")
             checkpoint = trainer.log_dir / "ckpt_latest.pt"
             if not checkpoint.is_file():
                 raise RuntimeError("Checkpoint was not saved.")
@@ -100,11 +105,12 @@ def main() -> None:
                 f"PASS: simulator + replay + world model + actor/critic + checkpoint reload; "
                 f"steps={trainer.iteration}, updates={trainer.num_updates}, "
                 f"compile={args.compile}, anchor_obs={args.anchor_obs}, "
+                f"full_size={args.full_size}, nse8={errors[-1].item():.6f}, "
                 f"elapsed={time.perf_counter() - started:.1f}s, "
                 f"torch_peak={torch.cuda.max_memory_allocated() / 2**30:.2f} GiB",
                 flush=True,
             )
-            print("Synthetic small-model smoke only; this is not a motion-tracking score.")
+            print("Synthetic motion smoke only; this is not a motion-tracking score.")
         finally:
             if trainer is not None:
                 trainer.env.close()
