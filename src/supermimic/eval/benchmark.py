@@ -2,9 +2,10 @@
 
 Every clip is played once from its first frame with the deterministic policy:
 no observation/action noise, no reset noise, no domain randomization (foot friction 1.0),
-deterministic physics. A clip *fails* if the training termination (pelvis height /
-tilt vs reference) fires before the clip ends. Normalised return = sum of per-step
-rewards / (max step reward * number of steps).
+fixed seed/settings (GPU numerical trajectories can still vary). A clip *fails* if the training termination (pelvis height /
+tilt vs reference) fires, or evaluation times out before the clip ends. A clip with
+L frames has L-1 transitions. ``norm_return`` averages the executed prefix;
+``full_norm_return`` uses the full clip budget, with zero reward after a failure.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ import torch
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.policy.nets import Policy, PolicyCfg
 
+MAX_STEP_REWARD = 0.1  # dt (0.02 s) * positive reward weights (5)
+
 
 @dataclass
 class ClipResult:
@@ -28,6 +31,27 @@ class ClipResult:
     failed: bool
     fail_step: int  # -1 if not failed
     terms: dict | None = None  # per-term mean reward per step (dt-scaled)
+    termination_reason: str | None = None
+
+    @property
+    def full_steps(self) -> int:
+        return max(self.frames - 1, 0)
+
+    @property
+    def return_sum(self) -> float:
+        return self.norm_return * MAX_STEP_REWARD * self.steps
+
+    @property
+    def full_norm_return(self) -> float:
+        return self.return_sum / (MAX_STEP_REWARD * max(self.full_steps, 1))
+
+    @property
+    def completion_fraction(self) -> float:
+        return min(self.steps / max(self.full_steps, 1), 1.0)
+
+    @property
+    def completed(self) -> bool:
+        return not self.failed and self.full_steps > 0 and self.steps >= self.full_steps
 
 
 def load_policy_from_checkpoint(path: str | Path, device: str) -> tuple[Policy, dict]:
@@ -42,6 +66,10 @@ def load_policy_from_checkpoint(path: str | Path, device: str) -> tuple[Policy, 
 
 @torch.no_grad()
 def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", num_envs: int | None = None, future_frames: int = 10, verbose: bool = True, anchor_obs: bool = False) -> list[ClipResult]:
+    if not npz_files:
+        raise ValueError("benchmark requires at least one motion clip")
+    if num_envs is not None and num_envs < 1:
+        raise ValueError("num_envs must be positive")
     num_envs = min(num_envs or 1024, len(npz_files))
     args = SuperMimicEnvCfgArgs(
         npz_files=npz_files,
@@ -62,7 +90,11 @@ def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", 
         cmd = env.command_manager.get_term("motion")
         lib = cmd.library
         n_clips = lib.num_clips
-        max_r = 0.1  # paper reward upper bound per step (dt * 5)
+        if any(clip.length < 2 for clip in lib.clips):
+            raise ValueError("benchmark clips must contain at least two frames")
+        clip_steps = torch.tensor(
+            [clip.length - 1 for clip in lib.clips], device=device, dtype=torch.long
+        )
 
         # Clip queue: env e plays clips e, e+N, e+2N, ...
         current = torch.arange(num_envs, device=device)
@@ -83,26 +115,39 @@ def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", 
             ret_sum += rew
             term_sum += env.reward_manager.term_rewards
             steps += 1
-            done = (term | tout) & active
+            reached_end = steps >= clip_steps[current.clamp(max=n_clips - 1)]
+            done = (term | tout | reached_end) & active
             if done.any():
                 ids = done.nonzero().squeeze(-1)
                 for e in ids.tolist():
                     ci = int(current[e])
                     if ci < n_clips and ci not in results:
                         st = int(steps[e])
+                        failed = bool(term[e]) or (bool(tout[e]) and not bool(reached_end[e]))
+                        reason = (
+                            "termination" if bool(term[e]) else
+                            "unexpected_timeout" if failed else "clip_end"
+                        )
                         results[ci] = ClipResult(
                             name=lib.clips[ci].name,
                             frames=lib.clips[ci].length,
                             steps=st,
-                            norm_return=float(ret_sum[e]) / (max_r * max(st, 1)),
-                            failed=bool(term[e]),
-                            fail_step=st if bool(term[e]) else -1,
+                            norm_return=float(ret_sum[e]) / (MAX_STEP_REWARD * max(st, 1)),
+                            failed=failed,
+                            fail_step=st if failed else -1,
                             terms={n: float(term_sum[e, i]) / max(st, 1) for i, n in enumerate(term_names)},
+                            termination_reason=reason,
                         )
                         remaining -= 1
                         if verbose and (len(results) % 50 == 0 or len(results) == n_clips):
                             print(f"  evaluated {len(results)}/{n_clips}")
-                # advance the queue for these envs (the auto-reset already used forced_frame)
+                # The command's clip_end timeout arrives one step after the last
+                # valid transition. Stop at L-1 and explicitly reset only these
+                # natural endings; term/tout slots have already auto-reset.
+                natural_ids = (done & reached_end & ~(term | tout)).nonzero().squeeze(-1)
+                if natural_ids.numel() > 0 and remaining > 0:
+                    obs, _ = env.reset(env_ids=natural_ids)
+                # Both reset paths used the previously queued forced_frame.
                 current[ids] = nxt[ids]
                 nxt[ids] = nxt[ids] + num_envs
                 finished = current[ids] >= n_clips
@@ -120,14 +165,40 @@ def summarize(results: list[ClipResult]) -> dict:
     n = len(results)
     failed = sum(r.failed for r in results)
     mean_ret = sum(r.norm_return for r in results) / max(n, 1)
-    # Length-weighted return (paper Fig. 3a uses the benchmark aggregate; weighting by steps).
+    # Preserve prefix-quality metrics; report full-clip quality and coverage separately.
     tot_steps = sum(r.steps for r in results)
     w_ret = sum(r.norm_return * r.steps for r in results) / max(tot_steps, 1)
-    out = {"clips": n, "failed": failed, "mean_norm_return": mean_ret, "step_weighted_norm_return": w_ret}
+    full_steps = sum(r.full_steps for r in results)
+    out = {
+        "clips": n,
+        "failed": failed,
+        "completed": sum(r.completed for r in results),
+        "mean_norm_return": mean_ret,
+        "step_weighted_norm_return": w_ret,
+        "mean_full_clip_norm_return": sum(r.full_norm_return for r in results) / max(n, 1),
+        "full_clip_step_weighted_norm_return": (
+            sum(r.return_sum for r in results) / (MAX_STEP_REWARD * max(full_steps, 1))
+        ),
+        "mean_completion_fraction": sum(r.completion_fraction for r in results) / max(n, 1),
+        "step_completion_fraction": (
+            sum(min(r.steps, r.full_steps) for r in results) / max(full_steps, 1)
+        ),
+    }
     if results and results[0].terms:
         out["terms"] = {k: sum(r.terms[k] * r.steps for r in results) / max(tot_steps, 1) for k in results[0].terms}
     return out
 
 
 def save_results(results: list[ClipResult], path: str | Path) -> None:
-    Path(path).write_text(json.dumps({"summary": summarize(results), "clips": [asdict(r) for r in results]}, indent=1))
+    clips = [
+        {
+            **asdict(r),
+            "full_steps": r.full_steps,
+            "return_sum": r.return_sum,
+            "full_norm_return": r.full_norm_return,
+            "completion_fraction": r.completion_fraction,
+            "completed": r.completed,
+        }
+        for r in results
+    ]
+    Path(path).write_text(json.dumps({"summary": summarize(results), "clips": clips}, indent=1))

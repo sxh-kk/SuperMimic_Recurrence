@@ -2,7 +2,7 @@
 
 ## 本轮目标与边界
 
-在本机单张 RTX 4090 上训练默认观测、seed=0 的 LAFAN1 基线，使用 40 段真实动作。最初按 6 小时上限启动；用户随后要求改为**本轮累计约 1 小时，保存检查点后停止**，目标上海时间 2026-10-23 19:25 左右。实际已于 **19:27:02 退出并保存 `ckpt_1h.pt`**，详见下文归档结果。当前首跑不等于完成全量论文复现。完整跟踪评测单独执行。
+在本机单张 RTX 4090 上训练默认观测、seed=0 的 LAFAN1 基线，使用 40 段真实动作。最初按 6 小时上限启动；用户随后要求改为**本轮累计约 1 小时，保存检查点后停止**，目标上海时间 2026-10-23 19:25 左右。实际已于 **19:27:02 退出并保存 `ckpt_1h.pt`**，详见下文归档结果。当前首跑不等于完成全量论文复现。全库评测与三段对照视频已完成，见 [实测效果与查看方式](08_一小时训练评测与效果查看.md)。
 
 ## 2026-10-23：数据准备与验收
 
@@ -129,12 +129,13 @@ env -u PYTHONPATH -u PYTHONHOME uv run --locked python scripts/local/stop_after_
 
 ## 评测与恢复约定
 
-本轮结束后使用稳定的编号检查点或已停止写入的 latest 做全 40 段评测。训练中不并行评测，以免占用同一张 GPU、改变本轮时间预算。当前 benchmark 的 `norm_return` 使用实际执行步数作分母；报告须同时列失败数，并另外核对整段 `frames-1` 分母结果，不能直接将其称为严格论文分数。
+本轮使用归档 `ckpt_1h.pt` 完成全 40 段评测。训练中未并行评测。benchmark 的 `norm_return` 保留实际执行步数分母，现已新增整段 `frames-1` 预算回报、覆盖率和完成数，并修正原入口片尾多走一步；不直接将这些指标称为严格论文分数。实测主结果为 31/40 完整结束、9 段失败，详见文档 08。
 
 ```bash
 env -u PYTHONPATH -u PYTHONHOME uv run --locked python scripts/eval_benchmark.py \
-  --ckpt logs/lafan_paper_s0_20261023/ckpt_latest.pt \
-  --npz-dir data/npz/lafan1 --num-envs 40
+  --ckpt logs/lafan_paper_s0_20261023/ckpt_1h.pt \
+  --npz-dir data/npz/lafan1 --num-envs 40 \
+  --out logs/lafan_paper_s0_20261023/benchmark_1h_strict.json
 ```
 
 现有检查点不保存 replay 或仿真状态，恢复不等于逐步完全接续。后续若恢复编号 N 的检查点，需要另建运行名、使用相同动作集和观测配置，并将 `--schedule.warmup-iterations` 设为 `N+40`，先重新填充 replay；该恢复路径尚未做真实训练的独立进程验证。
@@ -145,7 +146,7 @@ env -u PYTHONPATH -u PYTHONHOME uv run --locked python scripts/eval_benchmark.py
 
 1. 对全部 40 段从首帧进行整段评测，报告失败数、执行步数 / 总动作长度、失败时刻和跟踪回报；不能仅用训练时随机 10 秒片段的回报判断效果。
 2. 使用 `scripts/play.py` 查看三维回放，默认半透明机器人为参考动作、实心机器人为策略实际动作。重点看走路、舞蹈、跳跃的姿态偏差、脚滑、漂移和摔倒；较差片段也须保留展示。
-3. 必要时使用 `scripts/diag_drift.py` 补充位置和朝向漂移诊断。当前回放入口支持本机窗口或 viser 浏览器，尚未提供直接导出 MP4 的参数；本机图形回放和视频导出尚未验证。
+3. 必要时使用 `scripts/diag_drift.py` 补充位置和朝向漂移诊断。交互回放支持本机窗口或 viser 浏览器；现已另增 `scripts/local/export_tracking_video.py`，完成无头 MP4 的实际验证和三段对照导出，见文档 08。
 
 例如，本轮训练结束后查看舞蹈：
 
