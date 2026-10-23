@@ -281,6 +281,8 @@ def main():
     parser.add_argument("--catch-priority", action="store_true")
     parser.add_argument("--balance-support-com", action="store_true")
     parser.add_argument("--gravity-seed", action="store_true")
+    parser.add_argument("--return-seed-stance", action="store_true")
+    parser.add_argument("--free-air-tuck", action="store_true")
     parser.add_argument("--no-render", action="store_true")
     args = parser.parse_args()
     try:
@@ -289,6 +291,8 @@ def main():
         parser.error(str(error))
     if min(args.population, args.generations, args.threads) < 1 or args.seconds < 2:
         parser.error("population/generations/threads must be positive and seconds >= 2")
+    if args.return_seed_stance and not args.gravity_seed:
+        parser.error("--return-seed-stance requires --gravity-seed")
     if not np.isclose(args.seconds / CONTROL_DT, round(args.seconds / CONTROL_DT)):
         parser.error("seconds must be an integer number of 20 ms control intervals")
     out_dir = args.out_dir.resolve()
@@ -303,7 +307,9 @@ def main():
                                    coordinated_ik=not args.linear_leg_pose,
                                    balance_support_com=args.balance_support_com,
                                    catch_priority=args.catch_priority,
-                                   gravity_seed=args.gravity_seed)
+                                   gravity_seed=args.gravity_seed,
+                                   return_seed_stance=args.return_seed_stance,
+                                   free_air_tuck=args.free_air_tuck)
     generator = np.random.default_rng(args.seed)
     mean, deviation = DEFAULT.copy(), (UPPER - LOWER) * 0.30
     if args.initial_search:

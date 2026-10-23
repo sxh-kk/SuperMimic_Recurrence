@@ -34,10 +34,11 @@ PARAMETER_NAMES = (
     "rear_tuck_delta", "rear_tuck_seconds", "front_press_seconds",
     "ankle_pop_lead_seconds",
     "front_pop_lead_seconds",
+    "rear_leg_pop_lead_seconds",
 )
-LOWER = np.array([0.20, 0.10, 0.20, 0.06, -0.04, 0.20, 0.18, -0.15, -0.65, -0.25, 0.10, 0.03, 0.0, 0.40, 0.02, 0.03, 0.0, 0.0])
-UPPER = np.array([1.10, 0.70, 1.30, 0.20, 0.14, 1.20, 0.55, 0.15, 0.65, 0.25, 0.70, 0.10, 0.10, 1.50, 0.14, 0.18, 0.22, 0.14])
-DEFAULT = np.array([0.55, 0.30, 0.70, 0.12, 0.06, 0.65, 0.32, 0.0, 0.0, 0.0, 0.35, 0.05, 0.03, 1.0, 0.06, 0.10, 0.0, 0.0])
+LOWER = np.array([0.20, 0.10, 0.20, 0.06, -0.04, 0.20, 0.18, -0.15, -0.65, -0.25, 0.10, 0.03, 0.0, 0.40, 0.02, 0.03, 0.0, 0.0, 0.0])
+UPPER = np.array([1.10, 0.70, 1.30, 0.20, 0.14, 1.20, 0.55, 0.15, 0.65, 0.25, 0.70, 0.10, 0.10, 1.50, 0.14, 0.18, 0.22, 0.14, 0.16])
+DEFAULT = np.array([0.55, 0.30, 0.70, 0.12, 0.06, 0.65, 0.32, 0.0, 0.0, 0.0, 0.35, 0.05, 0.03, 1.0, 0.06, 0.10, 0.0, 0.0, 0.0])
 CONTROL_DT = 0.02
 
 
@@ -160,6 +161,8 @@ class ControlProblem:
     catch_priority: bool = False
     board_geometry: BoardCollisionGeometry | None = None
     control_bias: np.ndarray | None = None
+    return_seed_stance: bool = False
+    free_air_tuck: bool = False
 
 
 def make_control_problem(
@@ -171,6 +174,8 @@ def make_control_problem(
     balance_support_com: bool = False,
     catch_priority: bool = False,
     gravity_seed: bool = False,
+    return_seed_stance: bool = False,
+    free_air_tuck: bool = False,
 ) -> ControlProblem:
     """Build named sensors and an initially stationary, contact-aligned wide stance."""
     spec = make_scene_spec(timestep=timestep)
@@ -196,6 +201,13 @@ def make_control_problem(
                     objtype=mujoco.mjtObj.mjOBJ_GEOM, objname="ground",
                     reftype=mujoco.mjtObj.mjOBJ_GEOM, refname="board_tail",
                     intprm=[1 << int(mujoco.mjtConDataField.mjCONDATA_FORCE), 3, 1])
+    spec.add_sensor(name="board_com_velocity", type=mujoco.mjtSensor.mjSENS_SUBTREELINVEL,
+                    objtype=mujoco.mjtObj.mjOBJ_BODY, objname=BOARD_BODY_NAME)
+    for side in ("left", "right"):
+        spec.add_sensor(name=f"{side}_force_on_board", type=mujoco.mjtSensor.mjSENS_CONTACT,
+                        objtype=mujoco.mjtObj.mjOBJ_BODY, objname=f"{side}_ankle_roll_link",
+                        reftype=mujoco.mjtObj.mjOBJ_BODY, refname=BOARD_BODY_NAME,
+                        intprm=[1 << int(mujoco.mjtConDataField.mjCONDATA_FORCE), 3, 1])
     model = spec.compile()
     data = mujoco.MjData(model)
     index = SceneIndex.from_model(model)
@@ -267,7 +279,8 @@ def make_control_problem(
     limits = model.jnt_range[joint_ids].copy()
     slices = {}
     for name in ["left_foot_board", "right_foot_board", "tail_tip_world",
-                 "robot_com_velocity", "tail_tip_velocity", "tail_ground_force"] + [
+                 "robot_com_velocity", "tail_tip_velocity", "tail_ground_force",
+                 "board_com_velocity", "left_force_on_board", "right_force_on_board"] + [
         f"{wheel.removesuffix('_joint')}_world" for wheel in BOARD_JOINT_NAMES
     ]:
         sensor = model.sensor(name)
@@ -351,7 +364,17 @@ def make_control_problem(
             "preserve_support_com_xy": balance_support_com,
         }
     geometry = BoardCollisionGeometry.from_model(model, index, data.qpos)
+    report["free_air_tuck"] = {
+        "enabled": free_air_tuck, "hip_delta_per_knee_delta": -1.0,
+        "outward_hip_roll_per_knee_delta": 0.3,
+        "ankle_targets": "initial stance joint angles; no stance orientation constraint",
+        "arm_clearance": {"shoulder_pitch_rad": -0.4,
+                          "shoulder_roll_rad": [0.65, -0.65], "elbow_rad": 1.4},
+        "stance_crouch_and_drive_leg_targets_unchanged": True,
+    }
     control_bias = None
+    if return_seed_stance and not gravity_seed:
+        raise ValueError("return_seed_stance requires gravity_seed")
     if gravity_seed:
         solver = ContactStatics(model, index)
         solution = solver.solve(data)
@@ -364,24 +387,26 @@ def make_control_problem(
             "clipped_targets": int(np.count_nonzero(raw_target != seeded)),
             "assumed_contacts_not_applied_forces": True,
         }
+        report["return_seed_stance"] = return_seed_stance
     return ControlProblem(model, index, data.qpos.copy(), data.qvel.copy(),
                           nominal, limits, slices, foot_targets, report, tables, catch_priority,
-                          geometry, control_bias)
+                          geometry, control_bias, return_seed_stance, free_air_tuck)
 
 
 def control_trajectory(problem: ControlProblem, parameters, seconds: float = 2.2) -> np.ndarray:
     """Smooth joint targets for settle, crouch, rear-foot pop, tuck and landing."""
     raw = np.asarray(parameters, dtype=float)
-    if raw.shape in ((13,), (16,), (17,)):
+    if raw.shape in ((13,), (16,), (17,), (18,)):
         raw = np.r_[raw, DEFAULT[len(raw):]]
     if raw.shape != DEFAULT.shape:
-        raise ValueError(f"expected 13, 16, 17 or {len(DEFAULT)} finite control parameters")
+        raise ValueError(f"expected 13, 16, 17, 18 or {len(DEFAULT)} finite control parameters")
     if not np.isfinite(raw).all():
         raise ValueError("control parameters must be finite")
     p = np.clip(raw, LOWER, UPPER)
     (crouch, extension, front_tuck, pop_time, delay, air_tuck, air_time,
      ankle_roll, ankle_pitch, hip_roll, front_extension, drive_time, rear_delay,
-     rear_tuck, rear_tuck_time, front_press_time, ankle_pop_lead, front_pop_lead) = p
+     rear_tuck, rear_tuck_time, front_press_time, ankle_pop_lead, front_pop_lead,
+     rear_leg_pop_lead) = p
     dt = problem.model.opt.timestep
     substeps = round(CONTROL_DT / dt)
     if not np.isclose(substeps * dt, CONTROL_DT):
@@ -402,6 +427,17 @@ def control_trajectory(problem: ControlProblem, parameters, seconds: float = 2.2
         pose[start + 5] += roll_delta
         return pose
 
+    def air_pose(knee_delta, side):
+        if not problem.free_air_tuck:
+            return leg_pose(knee_delta, side)
+        pose = problem.nominal.copy()
+        start = 0 if side == "left" else 6
+        pose[start] -= knee_delta
+        pose[start + 1] += (1 if side == "left" else -1) * 0.3 * knee_delta
+        pose[start + 3] += knee_delta
+        return np.clip(pose, problem.joint_limits[:, 0] + 0.005,
+                       problem.joint_limits[:, 1] - 0.005)
+
     def curve(times, values):
         # Cubic smoothstep interpolation has zero target velocity at each knot.
         segment = np.clip(np.searchsorted(times, time, side="right") - 1, 0, len(times) - 2)
@@ -418,15 +454,19 @@ def control_trajectory(problem: ControlProblem, parameters, seconds: float = 2.2
         pop_peak = pop_end + offset
         if side == "right":
             pop_peak = max(drive_end + 0.02, pop_peak - front_pop_lead)
+        else:
+            pop_peak = max(drive_end + 0.02, pop_peak - rear_leg_pop_lead)
         crouch_pose = leg_pose(crouch, side)
         drive_pose = leg_pose(-extension if side == "left" else -front_extension, side)
         pop_pose = leg_pose(-extension if side == "left" else front_tuck, side,
                             ankle_roll if side == "left" else 0.0)
+        if side == "right" and problem.free_air_tuck:
+            pop_pose = air_pose(front_tuck, side)
         if side == "left":
             pop_pose[4] += ankle_pitch
             pop_pose[1] += hip_roll
-        tucked_pose = leg_pose(rear_tuck if side == "left" else air_tuck, side)
-        land_pose = leg_pose(0.12, side)
+        tucked_pose = air_pose(rear_tuck if side == "left" else air_tuck, side)
+        land_pose = problem.nominal if problem.return_seed_stance else leg_pose(0.12, side)
         tuck_time = pop_peak + (rear_tuck_time if side == "left" else front_press_time)
         times = [0.0, 0.10, crouch_end, drive_end, pop_peak, tuck_time]
         poses = [problem.nominal, problem.nominal, crouch_pose, drive_pose, pop_pose, tucked_pose]
@@ -441,11 +481,23 @@ def control_trajectory(problem: ControlProblem, parameters, seconds: float = 2.2
             # drive. The leg extension/tuck trajectory is not reset or moved.
             pulse = [np.zeros(2), np.zeros(2), np.array([ankle_pitch, ankle_roll]),
                      np.zeros(2), np.zeros(2)]
-            old_times = [0.0, drive_end, pop_end + offset, tuck_time, seconds]
+            old_times = [0.0, drive_end, pop_peak, tuck_time, seconds]
             early_times = [0.0, drive_end - ankle_pop_lead,
-                           pop_end + offset - ankle_pop_lead,
+                           pop_peak - ankle_pop_lead,
                            tuck_time - ankle_pop_lead, seconds]
             target[:, [4, 5]] += curve(early_times, pulse) - curve(old_times, pulse)
+    if problem.free_air_tuck:
+        # Prepare arm clearance before free tuck: static FK at d=.8..1.5 showed
+        # wrist/thigh intersections with the original hanging-arm posture.
+        # This is still only bounded joint targets through the original motors.
+        air_arms = problem.nominal.copy()
+        air_arms[[15, 22]] = -0.4
+        air_arms[[16, 23]] = [0.65, -0.65]
+        air_arms[[18, 25]] = 1.4
+        arm_path = curve([0.0, 0.10, crouch_end, air_end, air_end + 0.30, seconds],
+                         [problem.nominal, problem.nominal, air_arms, air_arms,
+                          problem.nominal, problem.nominal])
+        target[:, 15:] = arm_path[:, 15:]
     if problem.control_bias is not None:
         target += problem.control_bias
     target = np.clip(target, problem.joint_limits[:, 0] + 0.005,
@@ -631,6 +683,10 @@ def score_rollout(problem: ControlProblem, states, sensors, *, sensor_stage_offs
     board_quat = q[:, index.board_qpos + 3:index.board_qpos + 7]
     board_upright = 1 - 2 * (board_quat[:, 1]**2 + board_quat[:, 2]**2)
     min_board_upright = float(board_upright.min())
+    actual_joints = q[:, index.robot_joint_qpos]
+    excess = np.maximum(problem.joint_limits[:, 0] - actual_joints,
+                        actual_joints - problem.joint_limits[:, 1]).clip(0)
+    maximum_actual_joint_violation = float(excess.max())
     geometry = problem.board_geometry or BoardCollisionGeometry.from_model(model, index, problem.qpos)
     collision_heights = geometry.clearances(q[:, index.board_qpos:index.board_qpos + 7])
     wheel_height = collision_heights[:, :geometry.wheel_count]
@@ -705,6 +761,20 @@ def score_rollout(problem: ControlProblem, states, sensors, *, sensor_stage_offs
             # the actual COM momentum present at a real force-producing impact.
             dynamics_reward += (2.5 * min(max(upward, 0), 1.2)
                                 - 1.5 * min(horizontal, 1.0) + 0.4 * min(downward, 1.5))
+            last_force = problem.sensor_slices["right_force_on_board"]
+            if sensors.shape[1] >= last_force.stop:
+                post = (dynamics_time >= t0 - 1e-9) & (dynamics_time < t0 + 0.04 - 1e-9)
+                rear_force = sensors[:, problem.sensor_slices["left_force_on_board"]][:, 2]
+                front_force = sensors[:, last_force][:, 2]
+                rear_impulse = float(np.maximum(-rear_force[post], 0).sum() * sample_dt)
+                front_impulse = float(np.maximum(-front_force[post], 0).sum() * sample_dt)
+                after = int(np.argmin(np.abs(dynamics_time - (t0 + 0.04))))
+                board_up = float(sensors[after, problem.sensor_slices["board_com_velocity"]][2])
+                impact.update(rear_downward_impulse_on_board_after_tail_40ms_n_s=rear_impulse,
+                              front_downward_impulse_on_board_after_tail_40ms_n_s=front_impulse,
+                              board_com_upward_speed_after_tail_40ms_m_s=board_up)
+                dynamics_reward += (1.5 * min(max(board_up, 0), 1.0)
+                                    - 0.4 * rear_impulse - 0.2 * front_impulse)
     score = (
         survival * (20 * min(clearance, 0.25) + 2 * min(geometric_air_seconds, 0.45)
                     + 40 * min(board_clearance, 0.15) * pop_gate)
@@ -727,6 +797,7 @@ def score_rollout(problem: ControlProblem, states, sensors, *, sensor_stage_offs
         score = ((100.0 if catch_eligible else -100.0) + 2 * min(extension_rise, 0.25)
                  - 20 * landing_error - 8 * floor_proxy
                  - 4 * max(board_escape - 0.25, 0) - 4 * max(0.8 - min_upright, 0))
+    score -= 30 * max(maximum_actual_joint_violation - 0.02, 0)
     return score, {
         "score": float(score), "maximum_all_wheel_clearance_m": clearance,
         "whole_board_geometric_clearance_above_5mm_longest_s": geometric_air_seconds,
@@ -744,6 +815,7 @@ def score_rollout(problem: ControlProblem, states, sensors, *, sensor_stage_offs
         "survival_reward_gate": survival,
         "catch_search_eligible": bool(catch_eligible),
         "search_observation_dt": sample_dt,
+        "maximum_actual_joint_limit_violation_rad": maximum_actual_joint_violation,
         "dynamics_sensor_stage_offset_s": sensor_stage_offset_s,
         **impact,
     }
