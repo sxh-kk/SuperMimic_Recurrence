@@ -434,7 +434,7 @@ def _evaluate(args) -> dict:
                     raw_action = reference.robot_state[goals[0], 7:36].copy()
                 else:
                     state = torch.tensor(states[-1], dtype=torch.float32, device=args.device)[None]
-                    raw_action = policy(state, refs[goals][None])[0].cpu().numpy().astype(float)
+                    raw_action = policy(state, refs[goals][None], frame=step + 1)[0].cpu().numpy().astype(float)
                 if not np.isfinite(raw_action).all():
                     numerical_failure = "nonfinite policy action"
                     break
@@ -523,6 +523,8 @@ def _evaluate(args) -> dict:
             ),
             "absolute_actuator_work_j": absolute_work,
             "reference_goal_offsets": [0] if policy is None else list(policy.cfg.reference_offsets),
+            "frozen_prefix_frame": None if policy is None else policy.cfg.frozen_prefix_frame,
+            "prefix_blend_frames": None if policy is None else policy.cfg.prefix_blend_frames,
             "goal_index_rule": "min(current_step + 1 + offset, last_reference_frame)",
             "time_scale_unverified": reference.metadata["time_scale"],
             "scope": "Full-state research prototype / reference-PD evaluation; not a complete SuperMimic paper implementation.",

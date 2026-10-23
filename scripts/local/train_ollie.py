@@ -13,7 +13,7 @@ import importlib.util
 import json
 import math
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import mujoco
@@ -62,6 +62,9 @@ def main():
     parser.add_argument("--wm-init", type=Path)
     parser.add_argument("--warm-start-bias", type=Path)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--policy-init", type=Path)
+    parser.add_argument("--frozen-prefix-frame", type=int)
+    parser.add_argument("--prefix-blend-frames", type=int, default=10)
     parser.add_argument("--teacher-anchor", type=Path)
     parser.add_argument("--teacher-weight", type=float, default=10.0)
     parser.add_argument("--actor-lr", type=float, help="Explicit optimizer learning-rate override after resume")
@@ -93,6 +96,10 @@ def main():
         parser.error("teacher anchor weight must be finite and nonnegative")
     if args.actor_lr is not None and (not math.isfinite(args.actor_lr) or args.actor_lr <= 0):
         parser.error("actor learning rate must be finite and positive")
+    if args.policy_init and (args.resume or args.warm_start_bias):
+        parser.error("policy-init is a weights-only alternative to resume or fixed bias")
+    if args.frozen_prefix_frame is not None and not (args.policy_init or args.resume):
+        parser.error("a frozen prefix must start from a trained policy")
     if (args.num_envs < 8 or args.iterations < 1 or args.model_window < 1
             or args.collect_steps < args.model_window or args.horizon < 1
             or args.batch_size < 1 or args.eval_every < 1 or args.replay_chunks < 1
@@ -118,7 +125,9 @@ def main():
         raise ValueError(f"reference has invalid phase-reset collisions: {geometry['worst']}")
     refs = torch.tensor(reference.state, dtype=torch.float32, device=args.device)
     confidence = torch.tensor(reference.confidence, dtype=torch.float32, device=args.device)
-    cfg = JointLearningConfig(residual_limit_rad=args.residual_limit)
+    cfg = JointLearningConfig(residual_limit_rad=args.residual_limit,
+                              frozen_prefix_frame=args.frozen_prefix_frame,
+                              prefix_blend_frames=args.prefix_blend_frames)
     if args.residual_limits_json:
         limits_document = json.loads(args.residual_limits_json.read_text())
         if tuple(limits_document["joint_names"]) != G1_JOINT_NAMES:
@@ -159,6 +168,18 @@ def main():
         actor_updates_done = initial.get("policy_updates_completed", 0)
         bc_updates_done = initial.get("behavior_cloning_updates_completed", 0)
         policy_initialization = initial.get("policy_initialization", "resumed_policy")
+    if args.policy_init:
+        initial = torch.load(args.policy_init, map_location=args.device, weights_only=True)
+        if (initial.get("schema") != "supermimic.ollie.actor.v1"
+                or tuple(initial["board_joint_names"]) != env.layout.board_joint_names
+                or initial.get("reference_sha256") != hashlib.sha256(args.reference.read_bytes()).hexdigest()
+                or asdict(JointLearningConfig(**initial["learning_config"]))
+                != asdict(replace(cfg, frozen_prefix_frame=None))):
+            raise ValueError("policy initializer reference/network/goal/limit contract differs")
+        policy.initialize_from_policy(initial["policy"])
+        actor_updates_done = initial.get("policy_updates_completed", 0)
+        bc_updates_done = initial.get("behavior_cloning_updates_completed", 0)
+        policy_initialization = "trained policy with optional frozen preparation network"
     if args.wm_init:
         # An explicit model initializer must win over the model bundled with a
         # resumed BC actor (which is deliberately untrained). Its optimizer is
@@ -183,6 +204,7 @@ def main():
                 raise ValueError("teacher must be verified and match the reference/joint/goal contracts")
             anchor = tuple(torch.as_tensor(teacher[name].copy(), dtype=torch.float32, device=args.device)
                            for name in ("state", "future_goals", "action"))
+            anchor_frames = torch.as_tensor(teacher["reference_goal_indices"][:, 0].copy(), device=args.device)
         anchor_state, anchor_goals, anchor_action = anchor
         if (anchor_state.shape != (len(anchor_action), env.layout.state_dim)
                 or anchor_goals.shape != (len(anchor_action), len(cfg.reference_offsets), env.layout.state_dim)
@@ -246,7 +268,7 @@ def main():
         states, actions, diagnostics, losses = [state[0].cpu()], [], [], []
         for frame in range(1, len(refs)):
             index = torch.full((args.num_envs,), frame, device=args.device)
-            action = policy(state, goals(index)).clamp(lower, upper)
+            action = policy(state, goals(index), frame=index).clamp(lower, upper)
             state = env.step(action).clone()
             if not torch.isfinite(state).all():
                 raise RuntimeError("nonfinite real evaluation")
@@ -320,7 +342,8 @@ def main():
             for step in range(args.collect_steps):
                 if step % 8 == 0:
                     noise = torch.randn_like(noise) * args.exploration
-                action = (policy(state, goals(starts + step + 1)) + noise).clamp(lower, upper)
+                frame = starts + step + 1
+                action = (policy(state, goals(frame), frame=frame) + noise).clamp(lower, upper)
                 state = env.step(action).clone()
                 if not torch.isfinite(state).all():
                     raise RuntimeError("nonfinite real training collection")
@@ -360,7 +383,7 @@ def main():
             actor_loss = predicted.new_zeros(())
             for step in range(args.horizon):
                 target_frame = (frame + step + 1).clamp(max=len(refs) - 1)
-                action = policy(predicted, goals(target_frame)).clamp(lower, upper)
+                action = policy(predicted, goals(target_frame), frame=target_frame).clamp(lower, upper)
                 predicted = model.step(predicted, action)
                 loss = tracking_loss(model.spec, predicted, refs[target_frame], confidence[target_frame])
                 root_error = model.spec.error_vector(predicted, refs[target_frame])[..., :6]
@@ -375,7 +398,8 @@ def main():
             actor_loss = actor_loss / args.horizon
             if anchor is not None:
                 anchor_ids = torch.randint(len(anchor_action), (args.batch_size,), device=args.device)
-                anchor_prediction = policy(anchor_state[anchor_ids], anchor_goals[anchor_ids])
+                anchor_prediction = policy(anchor_state[anchor_ids], anchor_goals[anchor_ids],
+                                           frame=anchor_frames[anchor_ids])
                 anchor_loss = (anchor_prediction - anchor_action[anchor_ids]).square().mean()
                 actor_loss = actor_loss + args.teacher_weight * anchor_loss
             actor_opt.zero_grad(set_to_none=True)

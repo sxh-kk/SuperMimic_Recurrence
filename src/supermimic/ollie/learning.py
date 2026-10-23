@@ -6,7 +6,7 @@ input/output contract. Fitting this model alone does not train an Ollie policy.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from torch import nn
@@ -24,6 +24,8 @@ class JointLearningConfig:
     residual_limit_rad: float = 0.25
     residual_limits_rad: tuple[float, ...] | None = None
     reference_offsets: tuple[int, ...] = (0, 5, 10)
+    frozen_prefix_frame: int | None = None
+    prefix_blend_frames: int = 10
 
 
 class JointWorldModel(nn.Module):
@@ -93,9 +95,29 @@ masked from the tracking goal; actual wheel motion remains a dynamics input.
                              persistent=False)
         self.encoder = MLP(layout.delta_dim * len(self.cfg.reference_offsets), (256, 128), 32)
         self.decoder = MLP(layout.feature_dim + 32, self.cfg.policy_hidden, 29, zero_last=True)
+        self.frozen_prefix = None
+        if self.cfg.frozen_prefix_frame is not None:
+            if (not isinstance(self.cfg.frozen_prefix_frame, int) or self.cfg.frozen_prefix_frame < 0
+                    or not isinstance(self.cfg.prefix_blend_frames, int) or self.cfg.prefix_blend_frames < 1):
+                raise ValueError("frozen prefix needs a nonnegative frame and positive blend duration")
+            self.frozen_prefix = JointResidualPolicy(
+                layout, replace(self.cfg, frozen_prefix_frame=None), device=device)
+            self.frozen_prefix.requires_grad_(False)
         self.to(device)
 
-    def forward(self, state: torch.Tensor, references: torch.Tensor) -> torch.Tensor:
+    def initialize_from_policy(self, weights: dict):
+        """Initialize both heads from a trained single policy, without stale optimizer state."""
+        if self.frozen_prefix is None:
+            self.load_state_dict(weights, strict=True)
+            return
+        missing, unexpected = self.load_state_dict(weights, strict=False)
+        expected = {"frozen_prefix." + name for name in self.frozen_prefix.state_dict()}
+        if unexpected or set(missing) != expected:
+            raise ValueError("initial weights must describe a compatible single policy")
+        self.frozen_prefix.load_state_dict(weights, strict=True)
+
+    def forward(self, state: torch.Tensor, references: torch.Tensor,
+                frame: torch.Tensor | int | None = None) -> torch.Tensor:
         if references.shape[-2:] != (len(self.cfg.reference_offsets), self.layout.state_dim):
             raise ValueError("future references must match the policy goal contract")
         # Quaternion primitives require identical batch shapes, not implicit broadcast.
@@ -107,7 +129,15 @@ masked from the tracking goal; actual wheel motion remains a dynamics input.
             ], dim=-1)
         latent = torch.tanh(self.encoder(errors.clamp(-20, 20).flatten(-2)))
         residual = torch.tanh(self.decoder(torch.cat([self.spec.canonical(state), latent], -1)))
-        return references[..., 0, 7:36] + self.residual_limits * residual
+        action = references[..., 0, 7:36] + self.residual_limits * residual
+        if self.frozen_prefix is not None:
+            if frame is None:
+                raise ValueError("phase curriculum requires the explicit current reference frame")
+            blend = ((torch.as_tensor(frame, dtype=state.dtype, device=state.device)
+                      - self.cfg.frozen_prefix_frame) / self.cfg.prefix_blend_frames).clamp(0, 1)
+            base = self.frozen_prefix(state, references)
+            action = base * (1 - blend[..., None]) + action * blend[..., None]
+        return action
 
 
 def tracking_loss(
