@@ -1,10 +1,12 @@
 # SuperMimic-Reproduced
 
+> 上游 README 归档，来源提交 `d9be385b3eeb13a638fb33fb200d3bfd9be9839f`。下述成绩和 CUDA 13 环境均为上游作者记录，不是本机结果；本机适配与实测请查看 [环境适配](02_本机环境适配.md) 和 [验证记录](03_本机验证与运行.md)。本次仅补充此归档说明并修正迁移后的相对文档链接。
+
 > **English summary.** An independent from-scratch reproduction of *SuperMimic* (arXiv:2610.28480): a learned differentiable world model plus short-horizon BPTT actor-critic for Unitree G1 whole-body motion tracking, built on [mjlab](https://github.com/mujocolab/mjlab) / MuJoCo Warp. Includes the data pipeline (LAFAN1, BONES-SEED 129.9k clips), differentiable FK and analytic reward heads, the world model and imagination trainer, torchrun data-parallel training, the Appendix-F benchmark, and an interactive replay viewer. On LAFAN1 it reaches the paper's 0.82 tracking score in 1.66 h on one RTX 5090 (with anchor-relative observations; paper-observation runs are in progress). Documentation is in Chinese; see `docs/` for the paper spec, plan, review log and experiment log.
 
 从零复现论文 **SuperMimic: Scaling Humanoid Whole-Body Control with One Differentiable World Model**（[arXiv:2610.28480](https://arxiv.org/abs/2610.28480)，CoRL 2026）：一个学习得到的可微世界模型 + 短视野 BPTT actor-critic，用于 Unitree G1 人形全身动作跟踪。底座是 [mjlab](https://github.com/mujocolab/mjlab)（MuJoCo Warp），固定到 commit `8bb2bc9`；不使用 rsl_rl，世界模型、BPTT 训练器、多 clip 动作库、基于回报的重置采样、评测全部自己实现。
 
-> 状态（2026-10-21）：LAFAN1 上达到论文量级（M3），BONES-SEED 全量数据管线与单卡训练完成，多卡训练已跑通；正式结果正在按论文观测口径重跑（e6/e7）。详见 [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md)。
+> 状态（2026-10-21）：LAFAN1 上达到论文量级（M3），BONES-SEED 全量数据管线与单卡训练完成，多卡训练已跑通；正式结果正在按论文观测口径重跑（e6/e7）。详见 [docs/EXPERIMENTS.md](EXPERIMENTS.md)。
 
 ## 结果速览
 
@@ -29,10 +31,10 @@
 
 | 文件 | 内容 |
 |---|---|
-| [docs/PAPER_SPEC.md](docs/PAPER_SPEC.md) | 论文全部数值、公式、协议的逐条转录；"未指明"清单 U1–U20 |
-| [docs/REPRODUCTION_PLAN.md](docs/REPRODUCTION_PLAN.md) | 复现计划：目标、环境、设计决策 D1–D20、repo 骨架、分阶段步骤、测试、预算、风险 |
-| [docs/REVIEW_LOG.md](docs/REVIEW_LOG.md) | 计划的自审与两轮对抗审查记录 |
-| [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) | 实验日志：每个实验的配置、曲线、评测、偏离计划的决定、踩坑记录 |
+| [docs/PAPER_SPEC.md](PAPER_SPEC.md) | 论文全部数值、公式、协议的逐条转录；"未指明"清单 U1–U20 |
+| [docs/REPRODUCTION_PLAN.md](REPRODUCTION_PLAN.md) | 复现计划：目标、环境、设计决策 D1–D20、repo 骨架、分阶段步骤、测试、预算、风险 |
+| [docs/REVIEW_LOG.md](REVIEW_LOG.md) | 计划的自审与两轮对抗审查记录 |
+| [docs/EXPERIMENTS.md](EXPERIMENTS.md) | 实验日志：每个实验的配置、曲线、评测、偏离计划的决定、踩坑记录 |
 | 论文原文 | [arXiv:2610.28480](https://arxiv.org/abs/2610.28480)（不随仓库分发 PDF） |
 
 ## 代码结构
