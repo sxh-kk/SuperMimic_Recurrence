@@ -273,7 +273,7 @@ def main():
                             time_s=np.array([r[6] for r in real_data]),
                             label_used=np.array([r[7] for r in real_data]),
                             schema=np.array("supermimic.ollie.entity_state.v1"),
-                            joint_names=np.array(G1_JOINT_NAMES),
+                            robot_joint_names=np.array(G1_JOINT_NAMES),
                             board_joint_names=np.array(BOARD_JOINT_NAMES),
                             control_dt=np.array(0.02),
                             reference_sha256=np.array(reference_hash),
