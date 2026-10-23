@@ -19,3 +19,4 @@ experiments/**/outputs/
 /references/
 /.cache/
 *.log
+/MUJOCO_LOG.TXT
