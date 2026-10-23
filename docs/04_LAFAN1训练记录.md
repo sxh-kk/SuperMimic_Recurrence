@@ -108,7 +108,7 @@ env -u PYTHONPATH -u PYTHONHOME uv run --locked python scripts/local/stop_after_
   --run-dir logs/lafan_paper_s0_20261023 --hours 1 --dry-run
 ```
 
-控制器将在本批代码提交后独立后台派发；派发状态随后追加。本段为截止安排，尚不代表训练已经停止或 `ckpt_1h.pt` 已生成。
+上海时间 **18:54:22** 已独立后台派发控制器，PID **1973654**，控制代码提交 `aaf888b` 已推送 GitHub。确认进程存活，`stop_status.json` 为 `waiting_deadline`，截止时间为 `2026-10-23T11:25:06Z`（上海 19:25:06），`signal_sent=false`；训练仍在正常运行。本段为截止安排，尚不代表训练已经停止或 `ckpt_1h.pt` 已生成。控制台为本机运行目录中的 `stop_controller.log`，结束结果记录在 `stop_status.json`。
 
 ## 评测与恢复约定
 
