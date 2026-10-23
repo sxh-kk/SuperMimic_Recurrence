@@ -238,9 +238,10 @@ def outcome(records: list[dict], *, full_reference: bool, numerical_failure: str
         "initial_penetration_below_2mm": records[0]["maximum_penetration_m"] <= 0.002,
         "tail_contact_precedes_40ms_board_flight": bool(tail_before_air),
         "board_flight_clearance_at_least_15mm": max(
-            row["minimum_wheel_clearance_m"] for row in records
+            row["minimum_board_clearance_m"] for row in records
         )
         >= 0.015,
+        "board_never_inverted": min(row["board_upright_cosine"] for row in records) > 0,
         "no_robot_geom_touches_ground": not robot_ground,
         "penetration_at_most_10mm": maximum_penetration <= 0.01,
         "final_300ms_standing_stable_on_board": bool(stable),
@@ -249,6 +250,7 @@ def outcome(records: list[dict], *, full_reference: bool, numerical_failure: str
     return {
         "success": all(rules.values()),
         "outcome": "SUCCESS" if all(rules.values()) else "FAILED",
+        "criteria_version": "whole_board_geometry_v2",
         "criteria": rules,
         "failure_reasons": [name for name, passed in rules.items() if not passed],
         "numerical_failure": numerical_failure,

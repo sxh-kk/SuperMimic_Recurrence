@@ -91,7 +91,8 @@ def run(reference, bias, sign, scale, velocity_gain, reference_hash, *, keep=Fal
                   initializations=1, intermediate_resets=0, board_actuators=0,
                   no_external_forces=True, untrained_controller=True)
     # Rank physical survival before tracking. Full contact success remains separate.
-    first_ground = result["robot_ground_first_time_s"] or float(data.time)
+    first_ground = result["robot_ground_first_time_s"]
+    first_ground = float(data.time) if first_ground is None else first_ground
     result["selection_score"] = first_ground + 2 * result["prepare_min_upright"]
     if keep:
         return result, model, records, np.array(poses), np.array(states), np.array(actions), np.array(times)
