@@ -100,3 +100,21 @@ env -u PYTHONPATH -u PYTHONHOME uv run --locked python scripts/eval_benchmark.py
 ```
 
 现有检查点不保存 replay 或仿真状态，恢复不等于逐步完全接续。后续若恢复编号 N 的检查点，需要另建运行名、使用相同动作集和观测配置，并将 `--schedule.warmup-iterations` 设为 `N+40`，先重新填充 replay；该恢复路径尚未做真实训练的独立进程验证。
+
+## 训练后如何查看效果
+
+本轮无需额外提供参考视频。LAFAN1 NPZ 已有完整三维参考动作，可以直接比较目标轨迹与策略实际控制的 G1：
+
+1. 对全部 40 段从首帧进行整段评测，报告失败数、执行步数 / 总动作长度、失败时刻和跟踪回报；不能仅用训练时随机 10 秒片段的回报判断效果。
+2. 使用 `scripts/play.py` 查看三维回放，默认半透明机器人为参考动作、实心机器人为策略实际动作。重点看走路、舞蹈、跳跃的姿态偏差、脚滑、漂移和摔倒；较差片段也须保留展示。
+3. 必要时使用 `scripts/diag_drift.py` 补充位置和朝向漂移诊断。当前回放入口支持本机窗口或 viser 浏览器，尚未提供直接导出 MP4 的参数；本机图形回放和视频导出尚未验证。
+
+例如，本轮训练结束后查看舞蹈：
+
+```bash
+env -u PYTHONPATH -u PYTHONHOME uv run --locked python scripts/play.py \
+  --ckpt logs/lafan_paper_s0_20261023/ckpt_latest.pt \
+  --clips dance1_subject1 --viewer viser
+```
+
+当前 40 段全部参与训练，再评测这 40 段衡量的是训练动作覆盖率与控制跟踪质量；未见动作泛化需另设未参与训练的数据。若后续希望测试用户指定的视频，需要先得到三维人体动作并重定向到 G1，转换成参考动作数据；当前策略不直接读取视频像素。
