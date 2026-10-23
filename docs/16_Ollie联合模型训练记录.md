@@ -32,7 +32,7 @@ env -u PYTHONPATH -u PYTHONHOME uv run --locked python scripts/local/train_ollie
 - 这些是按工程尺度归一化的状态预测指标，不是米制轨迹误差、成功率或视频动作复现指标，不能外推至尚无覆盖的起跳 / 接板。
 - 本机文件为 `logs/ollie_wm_pilot_01/model.pt`、`physical_transitions.pt`、`result.json`。检查点格式为 `supermimic.ollie.wm_pilot.v1`，与原平地权重不兼容。
 
-在该真实物理数据上另做冻结世界模型的4步BPTT集成检查，批量8，策略梯度有限且非零，检查输出为 `bptt_check.json`。这只证明梯度路径接通，未将该检查称为策略训练或Ollie成功。
+在该真实物理数据上另做冻结世界模型的4步BPTT集成检查，批量8。首次检查暴露四元数函数不接受隐式批量广播，已将当前状态显式扩展到三个未来目标的批量形状；修复后的实际检查损失0.06366793、策略梯度范数0.00540936，均有限且梯度非零，输出为 `bptt_check.json`。这只证明梯度路径接通，未将该检查称为策略训练或Ollie成功。
 
 ## 仍需完成
 

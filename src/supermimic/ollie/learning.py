@@ -81,7 +81,8 @@ masked from the tracking goal; actual wheel motion remains a dynamics input.
     def forward(self, state: torch.Tensor, references: torch.Tensor) -> torch.Tensor:
         if references.shape[-2:] != (len(self.cfg.reference_offsets), self.layout.state_dim):
             raise ValueError("future references must match the policy goal contract")
-        errors = self.spec.error_vector(references, state.unsqueeze(-2))
+        # Quaternion primitives require identical batch shapes, not implicit broadcast.
+        errors = self.spec.error_vector(references, state.unsqueeze(-2).expand_as(references))
         if self.layout.board_joints:
             errors = torch.cat([
                 errors[..., :-2 * self.layout.board_joints],
