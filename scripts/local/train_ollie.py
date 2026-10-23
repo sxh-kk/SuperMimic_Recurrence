@@ -10,10 +10,12 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import time
 from dataclasses import asdict
 from pathlib import Path
 
+import mujoco
 import torch
 
 from supermimic.data.motion_convert import G1_JOINT_NAMES
@@ -25,6 +27,30 @@ from supermimic.ollie.learning import (
     tracking_loss,
 )
 from supermimic.ollie.reference import JointReference
+
+
+def check_reference_geometry(model, indices, reference, maximum_penetration):
+    """Check every potential phase-reset pose, including robot self collisions."""
+    poses, _ = indices.unpack(torch.tensor(reference.state, dtype=torch.float64))
+    data = mujoco.MjData(model)
+    worst = {"penetration_m": 0.0, "frame": None, "geoms": []}
+    invalid_frames = []
+    for frame, pose in enumerate(poses):
+        data.qpos[:] = pose.numpy()
+        data.qvel[:] = 0
+        mujoco.mj_forward(model, data)
+        local = 0.0
+        for contact in data.contact[:data.ncon]:
+            depth = max(0.0, -float(contact.dist))
+            local = max(local, depth)
+            if depth > worst["penetration_m"]:
+                worst = {"penetration_m": depth, "frame": frame,
+                         "geoms": [model.geom(int(gid)).name for gid in contact.geom]}
+        if local > maximum_penetration + 1e-8:
+            invalid_frames.append(frame)
+    return {"passed": not invalid_frames, "maximum_allowed_penetration_m": maximum_penetration,
+            "invalid_frames": invalid_frames, "worst": worst,
+            "scope": "all actual model contacts: self, board and ground; geometric check only"}
 
 
 def main():
@@ -52,9 +78,12 @@ def main():
     parser.add_argument("--upright-weight", type=float, default=10.0)
     parser.add_argument("--wheel-model-weight", type=float, default=0.05)
     parser.add_argument("--native-evaluation", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--reference-max-penetration", type=float, default=0.002)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
+    if not math.isfinite(args.reference_max_penetration) or args.reference_max_penetration < 0:
+        parser.error("reference penetration threshold must be finite and nonnegative")
     if (args.num_envs < 8 or args.iterations < 1 or args.model_window < 1
             or args.collect_steps < args.model_window or args.horizon < 1
             or args.batch_size < 1 or args.eval_every < 1 or args.replay_chunks < 1):
@@ -72,6 +101,11 @@ def main():
     env = JointPhysicsEnv(env_cfg, args.device)
     if reference.layout != env.layout:
         raise ValueError("reference and simulator joint schemas differ")
+    geometry = check_reference_geometry(env.native_model, env.indices, reference,
+                                        args.reference_max_penetration)
+    (args.out_dir / "reference_geometry_check.json").write_text(json.dumps(geometry, indent=2) + "\n")
+    if not geometry["passed"]:
+        raise ValueError(f"reference has invalid phase-reset collisions: {geometry['worst']}")
     refs = torch.tensor(reference.state, dtype=torch.float32, device=args.device)
     confidence = torch.tensor(reference.confidence, dtype=torch.float32, device=args.device)
     cfg = JointLearningConfig(residual_limit_rad=args.residual_limit)
