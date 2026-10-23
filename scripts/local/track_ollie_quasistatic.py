@@ -30,12 +30,13 @@ from supermimic.ollie.state import JointStateIndices
 
 
 class TrackingExperiment:
-    def __init__(self, reference, seconds=2.76, inertial=False, absolute_upright=False):
+    def __init__(self, reference, seconds=2.76, inertial=False, absolute_upright=False,
+                 surface_patches=False):
         self.reference, self.seconds = reference, seconds
         self.absolute_upright = absolute_upright
         self.model, self.data, self.index = compile_scene(timestep=0.0025)
         self.indices = JointStateIndices.from_model(self.model, board_joint_names=BOARD_JOINT_NAMES)
-        self.solver = ContactStatics(self.model, self.index)
+        self.solver = ContactStatics(self.model, self.index, surface_patches=surface_patches)
         self.steps = round(seconds / 0.02)
         self.frames = np.arange(self.steps + 1)
         self.times = self.frames * 0.02
@@ -333,6 +334,8 @@ def main():
         "--feedback-scales", type=float, nargs="+", default=[0.0, 0.25, 0.45, 0.5, 1.0]
     )
     parser.add_argument("--inertial", action="store_true")
+    parser.add_argument("--surface-patches", action="store_true",
+                        help="Project assumed contacts to actual center/tail/nose top rectangles")
     parser.add_argument(
         "--absolute-upright",
         action="store_true",
@@ -365,7 +368,8 @@ def main():
         parser.error(
             "Requested support interval must have explicit bilateral foot-board stance priors"
         )
-    experiment = TrackingExperiment(reference, args.seconds, args.inertial, args.absolute_upright)
+    experiment = TrackingExperiment(reference, args.seconds, args.inertial, args.absolute_upright,
+                                    args.surface_patches)
     args.out_dir.mkdir(parents=True)
     limits_doc = json.loads(args.residual_limits.read_text())
     if tuple(limits_doc["joint_names"]) != G1_JOINT_NAMES:
@@ -446,6 +450,7 @@ def main():
             control_dt=0.02,
             inertial_reference_term=args.inertial,
             absolute_upright_feedback=args.absolute_upright,
+            contact_surface_patches=args.surface_patches,
             initializations=1,
             intermediate_resets=0,
             board_actuators=0,

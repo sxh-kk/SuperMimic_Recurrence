@@ -29,6 +29,7 @@ class StaticSolution:
     rank: int
     foot_point_projection_max_m: float
     iterations: int
+    contact_surface_names: tuple[str, ...] = ()
 
     def diagnostics(self) -> dict:
         return {
@@ -42,16 +43,22 @@ class ContactStatics:
     """12 point-force support: eight foot-board and four wheel-ground points.
 
     Force order is left foot's four rectangle corners, right foot's four, then
-    BOARD_JOINT_NAMES. Foot forces use board-local XYZ; ground forces world XYZ.
-    Feet use an approximate sole rectangle projected onto the flat deck patch.
+    BOARD_JOINT_NAMES. Foot forces use board-local XYZ in legacy mode, or the
+    selected top box's XYZ with surface_patches=True; ground forces world XYZ.
+    Feet use an approximate sole rectangle projected onto assumed support patches.
     Small reference gaps are assumed closed; neither support nor no-slip is
     guaranteed. All 45 equilibrium rows are checked after redundant-row removal.
     """
 
-    def __init__(self, model: mujoco.MjModel, index: SceneIndex, *, friction: float = 0.9):
+    def __init__(self, model: mujoco.MjModel, index: SceneIndex, *, friction: float = 0.9,
+                 surface_patches: bool = False):
         if not np.isfinite(friction) or friction <= 0:
             raise ValueError("friction must be positive and finite")
         self.model, self.index = model, index
+        self.surface_patches = surface_patches
+        self.surface_names = ()
+        self.deck_geoms = tuple(model.geom(name).id for name in
+                                ("board_center", "board_tail", "board_nose"))
         self.data = mujoco.MjData(model)
         self.friction = float(friction)
         self.kp = model.actuator_gainprm[index.robot_actuators, 0].copy()
@@ -73,22 +80,39 @@ class ContactStatics:
         model, data, index = self.model, self.data, self.index
         rotation = data.xmat[index.board_body].reshape(3, 3)
         center = data.xpos[index.board_body]
-        columns, projection = [], 0.0
+        columns, projection, names = [], 0.0, []
         for side in ("left", "right"):
             body = model.body(f"{side}_ankle_roll_link").id
             foot_rotation = data.xmat[body].reshape(3, 3)
             for x in (-0.035, 0.12):
                 for y in (-0.018, 0.018):
                     sole = data.xpos[body] + foot_rotation @ np.array([x, y, -0.035])
-                    local = rotation.T @ (sole - center)
-                    local[:2] = np.clip(local[:2], [-0.275, -0.10], [0.275, 0.10])
-                    local[2] = BOARD_TOP_OFFSET
-                    point = center + rotation @ local
+                    frame_rotation = rotation
+                    if self.surface_patches:
+                        patches = []
+                        for geom in self.deck_geoms:
+                            geom_rotation = data.geom_xmat[geom].reshape(3, 3)
+                            geom_local = geom_rotation.T @ (sole - data.geom_xpos[geom])
+                            size = model.geom_size[geom]
+                            geom_local[:2] = np.clip(geom_local[:2], -size[:2], size[:2])
+                            geom_local[2] = size[2]
+                            candidate = data.geom_xpos[geom] + geom_rotation @ geom_local
+                            patches.append((np.linalg.norm(candidate - sole), geom, candidate,
+                                            geom_rotation))
+                        _, geom, point, frame_rotation = min(patches, key=lambda item: item[0])
+                        names.append(model.geom(geom).name)
+                    else:
+                        # Retain the original flat-patch experiment exactly.
+                        local = rotation.T @ (sole - center)
+                        local[:2] = np.clip(local[:2], [-0.275, -0.10], [0.275, 0.10])
+                        local[2] = BOARD_TOP_OFFSET
+                        point = center + rotation @ local
+                        names.append("legacy_flat_patch")
                     projection = max(projection, float(np.linalg.norm(point - sole)))
                     mujoco.mj_jac(model, data, self.jac, self.rot_jac, point, body)
                     foot_jac = self.jac.copy()
                     mujoco.mj_jac(model, data, self.jac, self.rot_jac, point, index.board_body)
-                    columns.append((foot_jac - self.jac).T @ rotation)
+                    columns.append((foot_jac - self.jac).T @ frame_rotation)
         vertical = np.array([0.0, 0.0, 1.0])
         for name in BOARD_JOINT_NAMES:
             geom = model.geom(name.removesuffix("_joint") + "_collision").id
@@ -102,6 +126,8 @@ class ContactStatics:
             point[2] = 0.0
             mujoco.mj_jac(model, data, self.jac, self.rot_jac, point, int(model.geom_bodyid[geom]))
             columns.append(self.jac.T.copy())
+            names.append(name.removesuffix("_joint") + "_ground")
+        self.surface_names = tuple(names)
         return np.concatenate([self.b, *columns], axis=1), projection
 
     def solve(
@@ -178,6 +204,7 @@ class ContactStatics:
             rank,
             projection,
             int(solved.nit),
+            self.surface_names,
         )
 
     def pd_target(self, qref, qvel_ref, solution: StaticSolution, *, margin: float = 0.005):

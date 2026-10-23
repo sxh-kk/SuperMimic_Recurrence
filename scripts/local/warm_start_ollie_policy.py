@@ -202,7 +202,10 @@ def main():
 
         from scripts.local.track_ollie_quasistatic import TrackingExperiment
 
-        expert = TrackingExperiment(reference, seconds=count / 50)
+        surface_patches = teacher_metrics.get("contact_surface_patches", False)
+        if not isinstance(surface_patches, bool):
+            raise TypeError("Teacher surface-patch mode must be an explicit boolean")
+        expert = TrackingExperiment(reference, seconds=count / 50, surface_patches=surface_patches)
         limits_low = expert.solver.target_limits[:, 0] + 0.005
         limits_high = expert.solver.target_limits[:, 1] - 0.005
         rng = np.random.default_rng(args.seed)

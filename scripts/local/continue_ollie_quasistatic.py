@@ -174,7 +174,11 @@ def main():
     reference_hash = hashlib.sha256(args.reference.read_bytes()).hexdigest()
     if not bool(teacher["verified_teacher"]) or str(teacher["reference_sha256"]) != reference_hash:
         raise ValueError("Need a verified prefix for this exact reference")
-    experiment = TrackingExperiment(reference)
+    teacher_metadata = json.loads(str(teacher["metadata_json"].item()))
+    surface_patches = teacher_metadata.get("contact_surface_patches", False)
+    if not isinstance(surface_patches, bool):
+        raise TypeError("Teacher surface-patch mode must be an explicit boolean")
+    experiment = TrackingExperiment(reference, surface_patches=surface_patches)
     extend_feedback_reference(experiment)
     args.out_dir.mkdir(parents=True)
     candidates = [
@@ -191,6 +195,7 @@ def main():
             case=name,
             reference_sha256=reference_hash,
             prefix_teacher_sha256=hashlib.sha256(args.teacher.read_bytes()).hexdigest(),
+            contact_surface_patches=surface_patches,
         )
         out = args.out_dir / name
         out.mkdir()
