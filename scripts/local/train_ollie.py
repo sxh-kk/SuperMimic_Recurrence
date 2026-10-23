@@ -8,6 +8,7 @@ an engineering full-state joint extension, not paper-exact SuperMimic sensing.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import time
 from dataclasses import asdict
@@ -30,6 +31,7 @@ def main():
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--wm-init", type=Path)
+    parser.add_argument("--warm-start-bias", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--iterations", type=int, default=100)
@@ -43,6 +45,10 @@ def main():
     parser.add_argument("--eval-every", type=int, default=10)
     parser.add_argument("--exploration", type=float, default=0.025)
     parser.add_argument("--residual-limit", type=float, default=0.25)
+    parser.add_argument("--root-pose-weight", type=float, default=0.25)
+    parser.add_argument("--upright-weight", type=float, default=10.0)
+    parser.add_argument("--wheel-model-weight", type=float, default=0.05)
+    parser.add_argument("--native-evaluation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
@@ -64,11 +70,21 @@ def main():
     if reference.layout != env.layout:
         raise ValueError("reference and simulator joint schemas differ")
     refs = torch.tensor(reference.state, dtype=torch.float32, device=args.device)
+    confidence = torch.tensor(reference.confidence, dtype=torch.float32, device=args.device)
     cfg = JointLearningConfig(residual_limit_rad=args.residual_limit)
     model = JointWorldModel(env.layout, cfg, args.device)
     policy = JointResidualPolicy(env.layout, cfg, args.device)
     wm_opt = torch.optim.Adam(model.parameters(), lr=cfg.model_lr)
     actor_opt = torch.optim.Adam(policy.parameters(), lr=cfg.policy_lr)
+    if args.warm_start_bias:
+        if args.resume:
+            raise ValueError("choose resume or initial fixed bias, not both")
+        bias_values = json.loads(args.warm_start_bias.read_text())["bias_rad"]
+        bias = torch.tensor(bias_values, dtype=torch.float32, device=args.device)
+        if bias.shape != (29,) or not torch.isfinite(bias).all() or (bias.abs() >= cfg.residual_limit_rad).any():
+            raise ValueError("warm-start bias must be 29 finite values strictly inside residual bounds")
+        with torch.no_grad():
+            policy.decoder.net[-1].bias.copy_(torch.atanh(bias / cfg.residual_limit_rad))
     if args.wm_init:
         initial = torch.load(args.wm_init, map_location=args.device, weights_only=False)
         if tuple(initial["board_joint_names"]) != env.layout.board_joint_names:
@@ -88,9 +104,17 @@ def main():
     lower = env.joint_limits[:, 0] + 0.005
     upper = env.joint_limits[:, 1] - 0.005
     replay = []
+    replay_states = replay_actions = replay_frames = None
     train_count = args.num_envs - max(args.num_envs // 8, 1)
     best_score = -float("inf")
     history = []
+    native_evaluate = None
+    if args.native_evaluation:
+        module_spec = importlib.util.spec_from_file_location(
+            "ollie_native_evaluation", Path(__file__).with_name("evaluate_ollie_policy.py"))
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+        native_evaluate = module.evaluate
 
     def goals(frame):
         return refs[(frame[..., None] + offsets).clamp(0, len(refs) - 1)]
@@ -101,13 +125,26 @@ def main():
                             train_count if training else args.num_envs,
                             (count,), device=args.device)
         starts = torch.randint(args.collect_steps - window + 1, (count,), device=args.device)
-        all_states = torch.stack([chunk[0] for chunk in replay])
-        all_actions = torch.stack([chunk[1] for chunk in replay])
-        all_frames = torch.stack([chunk[2] for chunk in replay])
         times = starts[None] + torch.arange(window + 1, device=args.device)[:, None]
-        return (all_states[chunks[None], times, ids[None]],
-                all_actions[chunks[None], times[:-1], ids[None]],
-                all_frames[chunks, ids] + starts)
+        return (replay_states[chunks[None], times, ids[None]],
+                replay_actions[chunks[None], times[:-1], ids[None]],
+                replay_frames[chunks, ids] + starts)
+
+    def actor_start_states():
+        # Recovery from an already flat-on-ground body is outside this policy's
+        # task. Keep failed transitions for dynamics fitting, while starting
+        # actor imagination only at physically recoverable real states.
+        candidates = replay_states[:, :-1, :train_count]
+        upright = 1 - 2 * (candidates[..., 4].square() + candidates[..., 5].square())
+        valid = (upright > 0.5) & (candidates[..., 2] - candidates[..., 73] > 0.4)
+        valid &= (candidates[..., :2] - candidates[..., 71:73]).norm(dim=-1) < 0.6
+        locations = valid.nonzero()
+        if not len(locations):
+            raise RuntimeError("no recoverable real actor start states")
+        selected = locations[torch.randint(len(locations), (args.batch_size,), device=args.device)]
+        chunk, step, world = selected.unbind(-1)
+        return (replay_states[chunk, step, world], replay_actions[chunk, step, world],
+                replay_frames[chunk, world] + step)
 
     @torch.no_grad()
     def real_evaluate(iteration):
@@ -144,25 +181,39 @@ def main():
         return result
 
     def save(path, iteration):
+        temporary = path.with_suffix(".tmp")
         torch.save({"schema": "supermimic.ollie.actor.v1", "policy": policy.state_dict(),
                     "model": model.state_dict(), "policy_optimizer": actor_opt.state_dict(),
                     "model_optimizer": wm_opt.state_dict(), "learning_config": asdict(cfg),
                     "environment_config": asdict(env_cfg),
                     "board_joint_names": env.layout.board_joint_names,
                     "reference": str(args.reference.resolve()), "iteration": iteration,
+                    "training_arguments": {key: str(value) if isinstance(value, Path) else value
+                                           for key, value in vars(args).items()},
                     "seed": args.seed, "observations": "full simulator state engineering prototype",
+                    "best_selection_score": None if best_score == -float("inf") else best_score,
                     "phase_resets": "training only; evaluation has one ground-start reset",
-                    "ollie_success_certified": False}, path)
+                    "ollie_success_certified": False}, temporary)
+        temporary.replace(path)
 
     initial_metrics = real_evaluate(0)
-    print(json.dumps({"initial_real_evaluation": initial_metrics}), flush=True)
     save(args.out_dir / "initial.pt", 0)
+    if native_evaluate:
+        native = native_evaluate(ckpt=args.out_dir / "initial.pt", reference=args.reference,
+                                 output=args.out_dir / "native_0000", render=False)
+        initial_metrics["native"] = native
+        initial_metrics["selection_score"] = -native["ranking_cost"]
+    best_score = initial_metrics["selection_score"]
+    save(args.out_dir / "best.pt", 0)
+    print(json.dumps({"initial_real_evaluation": initial_metrics}), flush=True)
     for iteration in range(1, args.iterations + 1):
         # Independent worlds are whole episodes; held-out world IDs never enter
         # model fitting or actor BPTT. Random phases increase physical coverage.
-        starts = torch.randint(max(1, len(refs) - args.collect_steps),
+        starts = torch.randint(len(refs) - 1,
                                (args.num_envs,), device=args.device)
-        starts[::4] = 0
+        # Half of both train/held-out worlds start from the ground. Collection
+        # may extend beyond the reference; targets then hold its final frame.
+        starts[::2] = 0
         initial = refs[starts].clone()
         at_start = starts == 0
         initial[at_start, 36:71] = 0
@@ -182,11 +233,14 @@ def main():
                 actions.append(action)
         replay.append((torch.stack(states), torch.stack(actions), starts))
         replay = replay[-args.replay_chunks:]
+        replay_states = torch.stack([chunk[0] for chunk in replay])
+        replay_actions = torch.stack([chunk[1] for chunk in replay])
+        replay_frames = torch.stack([chunk[2] for chunk in replay])
         model.requires_grad_(True)
         model.train()
         for _ in range(args.model_updates):
             batch_states, batch_actions, _ = sample_windows(True, args.batch_size, args.model_window)
-            wm_loss, _ = model.window_loss(batch_states, batch_actions)
+            wm_loss, _ = model.window_loss(batch_states, batch_actions, args.wheel_model_weight)
             wm_opt.zero_grad(set_to_none=True)
             if not torch.isfinite(wm_loss):
                 raise RuntimeError("nonfinite world model loss")
@@ -197,26 +251,29 @@ def main():
             wm_opt.step()
         with torch.no_grad():
             held_states, held_actions, _ = sample_windows(False, args.batch_size, args.model_window)
-            validation, validation_details = model.window_loss(held_states, held_actions)
+            validation, validation_details = model.window_loss(held_states, held_actions, args.wheel_model_weight)
         # Model weights stay fixed; derivatives with respect to policy actions
         # remain live through the complete imagined trajectory.
         model.eval().requires_grad_(False)
         actor_loss = refs.new_zeros(())
         actor_gradient = refs.new_zeros(())
         for _ in range(args.policy_updates):
-            batch_states, batch_actions, frame = sample_windows(True, args.batch_size, 1)
-            predicted = batch_states[0].detach()
-            previous = batch_actions[0].detach()
+            predicted, previous, frame = actor_start_states()
+            predicted, previous = predicted.detach(), previous.detach()
             actor_loss = predicted.new_zeros(())
             for step in range(args.horizon):
                 target_frame = (frame + step + 1).clamp(max=len(refs) - 1)
                 action = policy(predicted, goals(target_frame)).clamp(lower, upper)
                 predicted = model.step(predicted, action)
-                loss = tracking_loss(model.spec, predicted, refs[target_frame])
+                loss = tracking_loss(model.spec, predicted, refs[target_frame], confidence[target_frame])
+                root_error = model.spec.error_vector(predicted, refs[target_frame])[..., :6]
+                upright = 1 - 2 * (predicted[..., 4].square() + predicted[..., 5].square())
+                stability = args.root_pose_weight * root_error.square().mean()
+                stability = stability + args.upright_weight * (0.8 - upright).clamp_min(0).square().mean()
                 residual = action - refs[target_frame, 7:36]
                 rate = action - previous
                 actor_loss = actor_loss + (0.97 ** step) * (
-                    loss.mean() + 0.1 * residual.square().mean() + 0.02 * rate.square().mean())
+                    loss.mean() + stability + 0.1 * residual.square().mean() + 0.02 * rate.square().mean())
                 previous = action
             actor_loss = actor_loss / args.horizon
             actor_opt.zero_grad(set_to_none=True)
@@ -234,6 +291,12 @@ def main():
                "actor_loss": float(actor_loss.detach()), "actor_gradient": float(actor_gradient)}
         if iteration % args.eval_every == 0 or iteration == args.iterations:
             real = real_evaluate(iteration)
+            save(args.out_dir / "candidate.pt", iteration)
+            if native_evaluate:
+                native = native_evaluate(ckpt=args.out_dir / "candidate.pt", reference=args.reference,
+                                         output=args.out_dir / f"native_{iteration:04d}", render=False)
+                real["native"] = native
+                real["selection_score"] = -native["ranking_cost"]
             row["real_evaluation"] = real
             if real["selection_score"] > best_score:
                 best_score = real["selection_score"]

@@ -44,20 +44,30 @@ class JointWorldModel(nn.Module):
         delta = self.dynamics(features, joint_target, context)
         return self.spec.integrate(state, delta)
 
-    def window_loss(self, states: torch.Tensor, actions: torch.Tensor):
+    def window_loss(self, states: torch.Tensor, actions: torch.Tensor, wheel_weight: float = 1.0):
         if len(states) != len(actions) + 1:
             raise ValueError("window needs k+1 states and k actions")
+        if not 0 <= wheel_weight <= 1:
+            raise ValueError("wheel loss weight must be within [0,1]")
         predicted = states[0]
-        errors, board_errors = [], []
+        errors, raw_errors, board_errors, board_root_errors, robot_root_errors = [], [], [], [], []
         for step, action in enumerate(actions):
             predicted = self.step(predicted, action)
             vector = self.spec.error_vector(predicted, states[step + 1])
-            errors.append(vector.square().mean())
+            weights = vector.new_ones(vector.shape[-1])
+            if self.layout.board_joints:
+                weights[-2 * self.layout.board_joints:] = wheel_weight
+            errors.append((vector.square() * weights).sum(-1).mean() / weights.sum())
+            raw_errors.append(vector.square().mean())
             board_errors.append(vector[..., 70:].square().mean())
+            board_root_errors.append(vector[..., 70:82].square().mean())
+            robot_root_errors.append(vector[..., :6].square().mean())
         values = torch.stack(errors)
         return values.mean(), {
-            "nse_1step": values[0].detach(), "nse_kstep": values[-1].detach(),
+            "nse_1step": raw_errors[0].detach(), "nse_kstep": raw_errors[-1].detach(),
             "board_nse_kstep": board_errors[-1].detach(),
+            "board_root_nse_kstep": board_root_errors[-1].detach(),
+            "robot_root_pose_nse_kstep": robot_root_errors[-1].detach(),
         }
 
 
@@ -93,7 +103,10 @@ masked from the tracking goal; actual wheel motion remains a dynamics input.
         return references[..., 0, 7:36] + self.cfg.residual_limit_rad * residual
 
 
-def tracking_loss(spec: JointStateSpec, state: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def tracking_loss(
+    spec: JointStateSpec, state: torch.Tensor, target: torch.Tensor,
+    board_confidence: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Differentiable engineering tracking objective; no fictitious contact force.
 
 Reference wheel angles/speeds are never treated as observations. Real simulation
@@ -102,4 +115,5 @@ is still required for contact timing, success, penetration, and energy checks.
     error = spec.error_vector(state, target)
     robot = error[..., :70]
     board_root = error[..., 70:82]
-    return 0.5 * robot.square().mean(-1) + board_root.square().mean(-1)
+    confidence = 1.0 if board_confidence is None else board_confidence.clamp(0.1, 1)
+    return 0.5 * robot.square().mean(-1) + confidence * board_root.square().mean(-1)
