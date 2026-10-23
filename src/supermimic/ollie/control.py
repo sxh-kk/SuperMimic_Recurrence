@@ -312,7 +312,12 @@ def initial_state(problem):
 
 
 def balance_callback(problem: ControlProblem):
-    """50 Hz held ankle feedback; only ctrl changes, no root forces or state edits."""
+    """50 Hz held ankle feedback; positive projected tilt corrects supported root tilt.
+
+    The sign is backed by the independent +/- perturbation probe recorded in
+    docs/14: positive targets improve 0.6 s deviations, with a nonmonotone 0.3 s
+    transient. This is still an untuned engineering controller, not a stable actor.
+    """
     index = problem.index
     ankles = index.robot_actuators[[4, 5, 10, 11]]
     ankle_joints = problem.model.actuator_trnid[ankles, 0]
@@ -330,7 +335,7 @@ def balance_callback(problem: ControlProblem):
         tick = int(np.floor((data.time + 1e-9) / CONTROL_DT))
         old = cache.get(key)
         if old is not None and old[0] == tick and data.time >= old[1] - 1e-9:
-            data.ctrl[ankles] -= old[2]
+            data.ctrl[ankles] += old[2]
             data.ctrl[index.robot_actuators] = np.clip(
                 data.ctrl[index.robot_actuators], problem.joint_limits[:, 0] + 0.005,
                 problem.joint_limits[:, 1] - 0.005,
@@ -359,7 +364,7 @@ def balance_callback(problem: ControlProblem):
         corrections = np.clip(data.xaxis[ankle_joints] @ tilt_world,
                               [-0.35, -0.15, -0.35, -0.15], [0.35, 0.15, 0.35, 0.15])
         cache[key] = (tick, float(data.time), corrections)
-        data.ctrl[ankles] -= corrections
+        data.ctrl[ankles] += corrections
         data.ctrl[index.robot_actuators] = np.clip(
             data.ctrl[index.robot_actuators], problem.joint_limits[:, 0] + 0.005,
             problem.joint_limits[:, 1] - 0.005,
