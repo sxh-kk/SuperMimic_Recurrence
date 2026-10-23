@@ -1,0 +1,53 @@
+<mujoco model="ollie_passive_skateboard">
+  <!-- Authored for this project. Reduced straight-line Ollie board, not HUSKY's truck model. -->
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.0025" gravity="0 0 -9.81" integrator="implicitfast"/>
+  <default>
+    <default class="ollie_board">
+      <geom condim="3" friction="0.9 0.005 0.0001" solref="0.008 1"
+            solimp="0.95 0.99 0.001" rgba="0.18 0.12 0.06 1"/>
+      <joint damping="0" armature="0"/>
+      <default class="ollie_wheel">
+        <geom type="cylinder" size="0.0275 0.012" quat="0.70710678 0.70710678 0 0"
+              mass="0.08" condim="6" friction="0.9 0.001 0.00005"
+              rgba="0.88 0.87 0.78 1"/>
+      </default>
+    </default>
+  </default>
+  <worldbody>
+    <body name="board" pos="0 0 0.078" childclass="ollie_board">
+      <freejoint name="board_free"/>
+      <geom name="board_center" type="box" size="0.28 0.105 0.006" mass="1.20"/>
+      <!-- Rigid raised ends. The tail and nose are collision geometry, not movable hinges. -->
+      <geom name="board_tail" type="box" pos="-0.34 0 0.01275"
+            euler="0 0.20943951 0" size="0.062 0.102 0.006" mass="0.15"/>
+      <geom name="board_nose" type="box" pos="0.34 0 0.01275"
+            euler="0 -0.20943951 0" size="0.062 0.102 0.006" mass="0.15"/>
+      <geom name="board_front_axle" type="box" pos="0.21 0 -0.025"
+            size="0.018 0.075 0.012" mass="0.18" rgba="0.45 0.45 0.45 1"/>
+      <geom name="board_rear_axle" type="box" pos="-0.21 0 -0.025"
+            size="0.018 0.075 0.012" mass="0.18" rgba="0.45 0.45 0.45 1"/>
+      <site name="board_center_site" size="0.006" rgba="0.2 0.8 0.2 1"/>
+      <site name="board_tail_tip" pos="-0.40065 0 0.02564" size="0.006"
+            rgba="0.9 0.15 0.1 1"/>
+      <site name="board_nose_tip" pos="0.40065 0 0.02564" size="0.006"
+            rgba="0.1 0.3 0.9 1"/>
+      <body name="wheel_front_left" pos="0.21 0.086 -0.0465">
+        <joint name="wheel_front_left_joint" type="hinge" axis="0 1 0" limited="false"/>
+        <geom name="wheel_front_left_collision" class="ollie_wheel"/>
+      </body>
+      <body name="wheel_front_right" pos="0.21 -0.086 -0.0465">
+        <joint name="wheel_front_right_joint" type="hinge" axis="0 1 0" limited="false"/>
+        <geom name="wheel_front_right_collision" class="ollie_wheel"/>
+      </body>
+      <body name="wheel_rear_left" pos="-0.21 0.086 -0.0465">
+        <joint name="wheel_rear_left_joint" type="hinge" axis="0 1 0" limited="false"/>
+        <geom name="wheel_rear_left_collision" class="ollie_wheel"/>
+      </body>
+      <body name="wheel_rear_right" pos="-0.21 -0.086 -0.0465">
+        <joint name="wheel_rear_right_joint" type="hinge" axis="0 1 0" limited="false"/>
+        <geom name="wheel_rear_right_collision" class="ollie_wheel"/>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>
