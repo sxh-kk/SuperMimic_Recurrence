@@ -82,3 +82,5 @@ SMPL-X及前端权重已实际下载并使用，无资产等待项。GPU有限�
 可直接查看[原片与实际准备段对照](/home/zxc/SuperMimic/logs/ollie_sampling_mpc_prep_01/video_01/comparison_preparation.mp4)及[实际准备段原速视频](/home/zxc/SuperMimic/logs/ollie_sampling_mpc_prep_01/video_01/rollout.mp4)。对照仅展示phys0..2.76s，按用户估计的1.5慢放与原片0..4.14s对齐，右栏明确 `PREFIX PASS / actual preparation only; not an Ollie`；139帧均来自保存的真实qpos，没有重演状态来充当实际物理。
 
 空中参考也在继续校正。原片逐帧证据支持前脚拖nose、后脚较早回板，但现有局部IK与固定旧COM抛物线未能同时满足这些接触和完整有限几何。文档50正式候选保留安全几何后仍缺失前脚接触，明确FAILED且未送去训练；“目标接触”与真实几何见证分开。下一步依据合法落地站姿重新约束COM时序，再检查真实接触和板受力，不能把节点COM守恒或一段运动学回放称为复现成功。
+
+补充：该准备轨迹现已另行通过19项原生重放/质量门槛并导出教师，见文档55。由此固定训练3000次的首次BC并未保持教师质量：6个候选均未通过全部准备门槛，3000次候选的最小upright为0.849110，仍低于0.85；没有放宽阈值或晋升策略。一次完整5.14s诊断仍FAILED，见文档57。运动学landing-COM候选54也未通过碰撞检查，不作为合格训练目标；真实MPC准备段成功与这些后续失败分别保留。
