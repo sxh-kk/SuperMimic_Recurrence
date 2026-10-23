@@ -91,6 +91,8 @@ ctrl = clip(ctrl_raw, 原关节目标范围并留0.005rad边距)
 
 只有两个动作元素触发真实机械目标限位裁剪；没有为策略可达性裁掉教师残差。实际 29 维峰值、signed min/max、raw 峰值与规范 joint names 已保存到每个结果 JSON，推荐教师目录的 `residual_envelope.json` 另含完整命名数组与输入校验信息。BC 必须显式调整、保存策略每关节残差范围或另选可达教师，不能静默截断这些目标；本脚本没有修改策略范围。
 
+独立逐子步审计另发现：**目标合法不等于实际关节角严格不越界**。原MuJoCo关节限位为软约束，本轮右踝pitch实际最小-0.901835rad，越过模型下限0.029165rad（约1.671°）；腰pitch最大越界0.016138rad，右踝roll最大0.003535rad。初始姿态未越界，真实驱动力矩未越限。完整记录为 `logs/audit/teacher_feedback045_final_v2/signed_support_audit.json`。因此该数据只能用于明确标注的有限动态前缀初始化；若要求实际关节角零越界，它不合格，不能称全部实际关节范围严格通过。未改变关节软限位参数来消除或掩盖该偏差。
+
 ## 独立验证与惯性项诊断
 
 独立重新求解并重跑同参数时，state/action/future-goals/time 数组逐元素一致。再新建原生模型，**只回放已保存的 138 个实际动作**，1104 个子步的 92 维状态最大误差为 **0**，真实上表面支持和其他门槛重复通过。最终目录 `independent_action_replay.json` 保存该检查；数据形状、连续 transition、pre-action 时间、future-goal 索引、关节名字与参考 hash 也已实际核验。

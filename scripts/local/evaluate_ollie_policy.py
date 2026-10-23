@@ -89,6 +89,7 @@ class ContactObserver:
             for side in ("left", "right")
         }
         self.robot_body = int(model.jnt_bodyid[model.joint("floating_base_joint").id])
+        self.robot_ranges = model.jnt_range[model.dof_jntid[index.robot_joint_qvel]].copy()
 
     def observe(self, data) -> dict:
         wheel_contact = set()
@@ -171,6 +172,9 @@ class ContactObserver:
             "robot_root_height_m": float(data.qpos[self.index.robot_qpos + 2]),
             "board_upright_cosine": float(data.xmat[self.index.board_body, 8]),
             "robot_upright_cosine": float(data.xmat[self.robot_body, 8]),
+            "maximum_actual_joint_limit_violation_rad": float(np.maximum(
+                np.maximum(self.robot_ranges[:, 0] - data.qpos[self.index.robot_joint_qpos],
+                           data.qpos[self.index.robot_joint_qpos] - self.robot_ranges[:, 1]), 0).max()),
             "board_linear_speed_m_s": float(
                 np.linalg.norm(data.qvel[self.index.board_qvel : self.index.board_qvel + 3])
             ),
@@ -280,6 +284,9 @@ def outcome(records: list[dict], *, full_reference: bool, numerical_failure: str
         "tail_contact_windows": tail_windows,
         "final_contact_fractions": fractions,
         "maximum_penetration_m": maximum_penetration,
+        "minimum_robot_upright_cosine": min(row["robot_upright_cosine"] for row in records),
+        "maximum_actual_joint_limit_violation_rad": max(
+            row["maximum_actual_joint_limit_violation_rad"] for row in records),
         "maximum_all_wheel_clearance_m": max(row["minimum_wheel_clearance_m"] for row in records),
         "maximum_whole_board_clearance_m": max(row["minimum_board_clearance_m"] for row in records),
         "initial_penetration_m": records[0]["maximum_penetration_m"],
