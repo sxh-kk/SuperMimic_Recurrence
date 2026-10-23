@@ -32,6 +32,8 @@
 
 参考准备pelvis upright约0.824，源参考本身约0.826，都低于准备教师门槛0.85。下一候选需把姿态可达性、动态平衡、空中质心运动一致性一起处理，不能放宽实际验收来把失败标为成功。
 
+后续显式upright≥0.92的v4候选也已实际对照：`logs/ollie_quasistatic/tail_upright_prep_01` 中scale0.45/0.25身体在2.5950/2.6125s触地，scale0.65虽未触地但最小upright0.12870、XY偏移347.72mm、足偏移82.22mm，均不通过；139个QP仍全部静力可行。固定深蹲姿态最小upright0.83081。单独修正参考倾角没有救回这个动态控制器，不继续相同踝反馈配置的预算。v4文件和几何参数由文档47单独记录。
+
 ```bash
 env -u PYTHONPATH -u PYTHONHOME OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 \
 uv run --locked python scripts/local/track_ollie_quasistatic.py \
@@ -41,3 +43,11 @@ uv run --locked python scripts/local/track_ollie_quasistatic.py \
 ```
 
 上述命令使用正式v3重跑，预计结果对应相同数值数组，但本记录中的已执行结果以原v2文件及落盘hash为准。
+
+## 独立坐标与整机受力复核
+
+另对共享solver及track/continue/DAgger的opt-in传递做只读检查，没有发现应阻塞提交的坐标、法向或作用反作用P1问题。选中的top box以其`geom_xmat/geom_xpos`建立世界接触点，力列使用`(Jfoot-Jboard)^T Rgeom`，因此脚/板获得同一点相反世界力；法向与摩擦约束使用同一surface frame。轮地力仍为world frame，tau和位置PD的正号一致。默认legacy分支的公式与运算顺序未改，新模式只有显式开启或教师布尔metadata选择后才进入。
+
+独立复核没有只重算QP矩阵残差：读取已保存139帧的局部接触力，按每帧surface名称和真实几何旋转转回世界系，分别计算机器人与板整体的重力/接触合力，以及绕各自COM的外部合力矩。全139帧最大绝对误差分别为机器人合力 **5.7e-14 N**、板合力 **1.3e-13 N**、机器人合力矩 **3.2e-14 N·m**、板合力矩 **2.1e-14 N·m**。所有右脚4个点均采用tail，足点投影最大范围 **2.020～2.066 mm**；没有把倾斜tail力误按水平板坐标解释。解出的力仍只参与核算，从未施加到物理仿真。
+
+这能排除明显坐标/受力代数错误，不能保证软接触与PD动态闭环稳定。scale0.45实际upright在2.00/2.20/2.40 s已降为 **0.936/0.759/0.574**，反馈踝目标越来越大并触及目标限位；左踝roll最大原始目标超出实际裁剪值1.385 rad。较大scale0.65只能延缓失稳，最终仍不合格。最深固定姿态没有目标裁剪也降到upright0.7646，不能仅将失败归为目标裁剪。当前证据更支持继续处理参考姿态/动态任务与实际状态下的全身力矩分配，不支持通过改力基或放宽验收补救。
