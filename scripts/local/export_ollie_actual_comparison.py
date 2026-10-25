@@ -78,10 +78,21 @@ def main():
     if abs(duration - times[-1] * args.time_scale) > 0.1:
         raise ValueError("source duration and declared physical time scale differ by >100ms")
     args.out_dir.mkdir(parents=True)
-    model, _, _ = compile_scene(timestep=0.0025)
+    # Geometry is the same for the optional contact profile, but preserve the
+    # actual run's model provenance even when rendering only saved positions.
+    foot_deck_friction = result.get("foot_deck_friction")
+    if foot_deck_friction is not None and (
+        not isinstance(foot_deck_friction, (int, float))
+        or not math.isfinite(foot_deck_friction)
+        or foot_deck_friction <= 0
+    ):
+        raise ValueError("invalid saved foot-deck friction profile")
+    model, _, _ = compile_scene(
+        timestep=0.0025, foot_deck_friction=foot_deck_friction,
+    )
     rendered = render_actual(
         model, qpos, times,
-        {"mode": "Native MPC - continuous 5.14 s", "outcome": verdict["outcome"],
+        {"mode": "Native physics - continuous 5.14 s", "outcome": verdict["outcome"],
          "render_truth_label": "saved actual physics"},
         SimpleNamespace(out_dir=args.out_dir, video_fps=50),
     )
@@ -121,6 +132,11 @@ def main():
         "schema": "supermimic.ollie.actual_video_export.v1",
         "evaluation": str(args.evaluation.resolve()),
         "physical_outcome": verdict,
+        "model_contact_profile": {
+            "foot_deck_friction": foot_deck_friction,
+            "explicit_foot_deck_pairs": int(model.npair),
+            "simulation_run_by_exporter": False,
+        },
         "trajectory_sha256": original_hash,
         "source_video_sha256": digest(args.video),
         "source_video_probe": source,
