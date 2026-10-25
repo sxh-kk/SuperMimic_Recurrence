@@ -48,13 +48,14 @@ class NativeSamplingMPC:
     substeps = 8
     control_dt = 0.02
 
-    def __init__(self, reference_path, feedforward_path, seed=53):
+    def __init__(self, reference_path, feedforward_path, seed=53, *, foot_deck_friction=None):
         if mujoco.get_mjcb_control() is not None:
             raise RuntimeError("no global control callback allowed")
         self.reference_path, self.feedforward_path = reference_path, feedforward_path
+        self.foot_deck_friction = foot_deck_friction
         self.reference_hash = hashlib.sha256(reference_path.read_bytes()).hexdigest()
         self.reference = JointReference.load(reference_path)
-        spec = make_scene_spec(timestep=0.0025)
+        spec = make_scene_spec(timestep=0.0025, foot_deck_friction=foot_deck_friction)
         self.model = spec.compile()
         self.index = SceneIndex.from_model(self.model)
         self.indices = JointStateIndices.from_model(self.model, board_joint_names=BOARD_JOINT_NAMES)
@@ -164,7 +165,8 @@ class NativeSamplingMPC:
         physical_arrays = ("body_mass", "body_inertia", "body_ipos", "body_iquat", "jnt_range", "dof_damping",
                            "dof_armature", "geom_friction", "geom_size", "geom_pos", "geom_quat", "geom_contype",
                            "geom_conaffinity", "geom_solref", "geom_solimp", "actuator_gainprm", "actuator_biasprm",
-                           "actuator_forcerange", "actuator_gear", "actuator_trnid")
+                           "actuator_forcerange", "actuator_gear", "actuator_trnid", "pair_dim", "pair_geom1",
+                           "pair_geom2", "pair_friction", "pair_solref", "pair_solimp", "pair_margin", "pair_gap")
         arrays_equal = all(np.array_equal(getattr(m, name), getattr(self.branch_model, name)) for name in physical_arrays)
         report = {"batch": self.candidates, "control_steps": self.horizon, "physics_steps_per_control": 8, "threads": 16,
                   "wall_seconds": wall, "warm_snapshot_s": float(d.time),
@@ -172,6 +174,7 @@ class NativeSamplingMPC:
                   "sensor_pre_state_max_error": float(np.max(abs(sensed - before))),
                   "sensor_post_state_max_difference": float(np.max(abs(sensed - after))),
                   "physical_arrays_exact": arrays_equal, "sensor_alignment": "substep-start state",
+                  "foot_deck_friction": self.foot_deck_friction, "explicit_contact_pairs": int(m.npair),
                   "initial_warmstart_used": True, "main_data_unchanged_time_s": float(self.data.time)}
         if not arrays_equal or report["fullphysics_native_max_error"] or report["sensor_pre_state_max_error"] > 1e-12:
             raise RuntimeError(f"native branch proof failed: {report}")
@@ -326,11 +329,14 @@ def main():
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--seconds", type=float, default=.1)
     parser.add_argument("--benchmark-only", action="store_true")
+    parser.add_argument("--foot-deck-friction", type=float, default=None,
+                        help="Explicit foot/deck material hypothesis; None preserves legacy physics")
     args = parser.parse_args()
-    if args.out_dir.exists() or args.seconds not in (.1, .5, 1., 2.76):
-        parser.error("fresh directory and one gated fixed duration .1/.5/1/2.76 required")
+    if args.out_dir.exists() or args.seconds not in (.1, .5, 1., 2.6, 2.76):
+        parser.error("fresh directory and one gated fixed duration .1/.5/1/2.6/2.76 required")
     args.out_dir.mkdir(parents=True)
-    controller = NativeSamplingMPC(args.reference, args.feedforward)
+    controller = NativeSamplingMPC(args.reference, args.feedforward,
+                                   foot_deck_friction=args.foot_deck_friction)
     proof = controller.proof()
     (args.out_dir / "branch_proof.json").write_text(json.dumps(proof, indent=2) + "\n")
     print(json.dumps({"proof": proof}), flush=True)
@@ -377,6 +383,8 @@ def main():
                    wall_seconds=time.monotonic() - started, seed=53, candidates=controller.candidates, rounds=controller.rounds, horizon=controller.horizon,
                    knot_count=5, residual_dim=15, initial_sigma_rad=.06, elites=8,
                    physics_dt_s=.0025, control_dt_s=.02, mujoco_version=mujoco.__version__,
+                   foot_deck_friction=controller.foot_deck_friction,
+                   explicit_contact_pairs=int(m.npair), material_calibrated_from_real_board=False,
                    initializations=1, root_board_writes_after_initialization=0, contact_forces_applied=False,
                    board_actuators=0, actual_control_dim=29, verified_teacher=False, ollie_success_certified=False,
                    selected_sequence_was_evaluated=True, sensor_timing="pre-substep with shifted FULLPHYSICS state",

@@ -53,7 +53,9 @@ def audit(args):
     substeps = round(control_dt / physics_dt)
     if substeps < 1 or not np.isclose(substeps * physics_dt, control_dt):
         raise ValueError("Control interval must be a positive multiple of the physics step")
-    model, _, index = compile_scene(timestep=physics_dt)
+    model, _, index = compile_scene(
+        timestep=physics_dt, foot_deck_friction=args.foot_deck_friction
+    )
     if qpos.shape != (len(controls) + 1, model.nq) or qvel.shape != (len(qpos), model.nv):
         raise ValueError(
             "Saved qpos/qvel must cover each held control boundary, including initialization"
@@ -92,7 +94,7 @@ def audit(args):
         raise ValueError("Every board geom must participate in ground collision")
     board_columns = [active.index(gid) for gid in board]
     records, minimums, forces, replay_qpos, replay_qvel = [], [], [], [], []
-    board_rotations = []
+    board_rotations, executed_torques = [], []
 
     def observe():
         row = observer.observe(data)
@@ -129,6 +131,7 @@ def audit(args):
         for _ in range(substeps):
             previous_time = float(data.time)
             mujoco.mj_step(model, data)
+            executed_torques.append(data.actuator_force[index.robot_actuators].copy())
             if not np.isclose(data.time, previous_time + physics_dt, atol=1e-10, rtol=0):
                 raise RuntimeError("Native time discontinuity; no automatic restart is allowed")
             mujoco.mj_forward(model, data)
@@ -150,6 +153,9 @@ def audit(args):
         if row["duration_s"] >= args.minimum_flight - 1e-9
     ]
     rotations = np.asarray(board_rotations)
+    executed_torques = np.asarray(executed_torques)
+    force_limits = model.actuator_forcerange[index.robot_actuators]
+    cap_ratio = abs(executed_torques) / np.max(abs(force_limits), axis=1)
     report = {
         "schema": "supermimic.ollie.full_envelope_audit.v1",
         "input": str(args.rollout.resolve()),
@@ -162,6 +168,13 @@ def audit(args):
         "held_substeps": substeps,
         "control_order": args.control_order,
         "initial_control": args.initial_control,
+        "foot_deck_friction": args.foot_deck_friction,
+        "explicit_contact_pairs": int(model.npair),
+        "maximum_executed_torque_cap_fraction": float(cap_ratio.max()),
+        "maximum_executed_torque_limit_violation_nm": max(0.0, float(np.maximum(
+            force_limits[:, 0] - executed_torques, executed_torques - force_limits[:, 1]
+        ).max())),
+        "torque_sampling_stage": "after mj_step, before diagnostic mj_forward",
         "qpos_boundary_replay_max_error": error_qpos,
         "qvel_boundary_replay_max_error": error_qvel,
         "exact_replay_tolerance": args.tolerance,
@@ -186,9 +199,22 @@ def audit(args):
         "final_board_up_cosine": float(rotations[-1, 2, 2]),
         "contact_samples": len(records),
         "no_pose_writes_after_initialization": True,
-        "outcome": outcome(records, full_reference=True, numerical_failure=None),
+        "required_reference_duration_s": args.reference_duration,
+        "outcome": outcome(records, full_reference=bool(
+            times[-1] - times[0] >= args.reference_duration - 1e-8
+        ), numerical_failure=None),
         "scope": "A complete saved control episode, not a full original-video reproduction or learned policy claim.",
     }
+    if args.source_contacts:
+        source_records = json.loads(args.source_contacts.read_text())
+        original_keys = set(records[0]) - {"board_ground_normal_force_n"}
+        exact = len(source_records) == len(records) and all(
+            all(original.get(key) == row[key] for key in original_keys)
+            for original, row in zip(source_records, records, strict=False)
+        )
+        report["source_contacts_sha256"] = file_hash(args.source_contacts)
+        report["source_contact_observer_fields_exact"] = exact
+        report["exact_replay_passed"] &= exact
     if args.legacy_contacts:
         legacy_rows = list(csv.DictReader(args.legacy_contacts.open()))
         if len(legacy_rows) != len(records) - 1 or not np.allclose(
@@ -263,6 +289,11 @@ def main():
     parser.add_argument("--rollout", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--legacy-contacts", type=Path)
+    parser.add_argument("--source-contacts", type=Path,
+                        help="JSON source ContactObserver records for exact comparison")
+    parser.add_argument("--foot-deck-friction", type=float, default=None)
+    parser.add_argument("--reference-duration", type=float, default=5.14,
+                        help="Required original physical reference duration for a full episode")
     parser.add_argument("--control-dt", type=float)
     parser.add_argument("--physics-dt", type=float)
     parser.add_argument("--control-order", choices=("actuator", "g1"), default="actuator")
@@ -274,7 +305,8 @@ def main():
     parser.add_argument("--minimum-flight", type=float, default=0.04)
     parser.add_argument("--tolerance", type=float, default=1e-9)
     args = parser.parse_args()
-    if min(args.force_threshold, args.clearance, args.minimum_flight, args.tolerance) <= 0:
+    if (min(args.force_threshold, args.clearance, args.minimum_flight, args.tolerance) <= 0
+            or not np.isfinite(args.reference_duration) or args.reference_duration <= 0):
         parser.error("Thresholds must be positive")
     report = audit(args)
     print(
