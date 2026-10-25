@@ -16,7 +16,10 @@ from supermimic.ollie.physics import (
     BOARD_GEOM_NAMES,
     BOARD_JOINT_NAMES,
     WHEEL_RADIUS,
+    SceneIndex,
     compile_scene,
+    make_scene_spec,
+    reset_scene,
 )
 from supermimic.ollie.state import JointStateIndices
 
@@ -30,6 +33,7 @@ class JointEnvConfig:
     max_constraints: int = 512
     cuda_graph: bool = True
     foot_deck_friction: float | None = None
+    contact_observations: bool = False
 
 
 class JointPhysicsEnv:
@@ -45,9 +49,22 @@ class JointPhysicsEnv:
             raise ValueError("control_dt must be an integer multiple of physics_dt")
         self.device = torch.device(device)
         self.num_envs = self.cfg.num_envs
-        self.native_model, native_data, self.index = compile_scene(
-            timestep=self.cfg.physics_dt, foot_deck_friction=self.cfg.foot_deck_friction
-        )
+        if self.cfg.contact_observations:
+            import mujoco
+
+            spec = make_scene_spec(timestep=self.cfg.physics_dt, foot_deck_friction=self.cfg.foot_deck_friction)
+            for name, body in (("robot", "pelvis"), ("board", "board")):
+                spec.add_sensor(name=f"ollie_observer_{name}_com_velocity",
+                                type=mujoco.mjtSensor.mjSENS_SUBTREELINVEL,
+                                objtype=mujoco.mjtObj.mjOBJ_BODY, objname=body)
+            self.native_model = spec.compile()
+            native_data = mujoco.MjData(self.native_model)
+            self.index = SceneIndex.from_model(self.native_model)
+            reset_scene(self.native_model, native_data, self.index)
+        else:
+            self.native_model, native_data, self.index = compile_scene(
+                timestep=self.cfg.physics_dt, foot_deck_friction=self.cfg.foot_deck_friction
+            )
         self.indices = JointStateIndices.from_model(
             self.native_model, board_joint_names=BOARD_JOINT_NAMES
         )
@@ -90,6 +107,19 @@ class JointPhysicsEnv:
         self.joint_limits = torch.as_tensor(
             self.native_model.jnt_range[joint_ids].copy(), device=self.device, dtype=self.qpos.dtype
         )
+        self.contact_observer = None
+        if self.cfg.contact_observations:
+            from supermimic.ollie.gpu_contact_observer import GPUContactObserver
+
+            with wp.ScopedDevice(str(self.device)), wp.ScopedStream(self.stream):
+                self.contact_observer = GPUContactObserver(
+                    self.native_model, self.index, self.model, self.data, self.decimation, str(self.device)
+                )
+            self.contact_observations = wp.to_torch(self.contact_observer.buffer)
+            self.contact_initial_observation = wp.to_torch(self.contact_observer.initial_buffer)[:, 0]
+            self.contact_metric_names = self.contact_observer.metric_names
+            self.contact_metric_index = self.contact_observer.metric_index
+            self.contact_observation_schema = self.contact_observer.schema
         self.graph = None
         self.reset()
         if self.cfg.cuda_graph:
@@ -120,14 +150,22 @@ class JointPhysicsEnv:
         torch.cuda.synchronize(self.device)
         with self.wp.ScopedDevice(str(self.device)), self.wp.ScopedStream(self.stream):
             self.mjw.forward(self.model, self.data)
+            if self.contact_observer is not None:
+                self.contact_observer.record(0, initial=True)
         self.wp.synchronize_stream(self.stream)
+        if self.contact_observer is not None:
+            self.contact_observations[ids] = 0
         return self.state()
 
     def _advance(self):
         with self.wp.ScopedDevice(str(self.device)), self.wp.ScopedStream(self.stream):
-            for _ in range(self.decimation):
+            for substep in range(self.decimation):
                 self.mjw.step(self.model, self.data)
-            self.mjw.forward(self.model, self.data)
+                if self.contact_observer is not None:
+                    self.mjw.forward(self.model, self.data)
+                    self.contact_observer.record(substep)
+            if self.contact_observer is None:
+                self.mjw.forward(self.model, self.data)
 
     @torch.no_grad()
     def step(self, joint_targets: torch.Tensor):
