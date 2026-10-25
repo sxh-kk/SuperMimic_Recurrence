@@ -56,6 +56,7 @@ class Config:
 
 
 digest, write_json = base.digest, base.write_json
+DEFAULT_CONFIG = Config()
 
 
 def physical_compare(original, observed):
@@ -308,8 +309,8 @@ def foot_forces(controller, data):
     }
 
 
-def continuation_regression(controller, archive):
-    """The old60 next14 controls must reproduce every original row, on scratch."""
+def continuation_regression(controller, archive, config=DEFAULT_CONFIG):
+    """Replay every remaining archived control on scratch, never on main."""
     saved = json.loads((controller.prefix_path.parent / "contacts.json").read_text())
     before = fingerprint(controller.data, controller.model)
     scratch, maxima, records = (
@@ -317,7 +318,7 @@ def continuation_regression(controller, archive):
         {"qpos": 0.0, "qvel": 0.0, "state": 0.0},
         0,
     )
-    for frame in range(156, 170):
+    for frame in range(config.prefix_controls, len(archive["action"])):
         scratch.ctrl[controller.index.robot_actuators] = archive["action"][frame]
         for substep in range(8):
             mujoco.mj_step(controller.model, scratch)
@@ -326,7 +327,7 @@ def continuation_regression(controller, archive):
             source = saved[frame * 8 + substep + 1]
             if any(row[key] != source[key] for key in row):
                 raise RuntimeError(
-                    f"Old60 3.12→3.40 Observer regression differs at {frame}/{substep}"
+                    f"Old60 continuation Observer regression differs at {frame}/{substep}"
                 )
             records += 1
         for name, actual in (
@@ -340,7 +341,7 @@ def continuation_regression(controller, archive):
     if fingerprint(controller.data, controller.model) != before:
         raise RuntimeError("Continuation regression mutated the real hot state")
     return {
-        "controls": 14,
+        "controls": len(archive["action"]) - config.prefix_controls,
         "observer_rows": records,
         "all_observer_fields_exact": True,
         "maximum_errors": maxima,
@@ -357,12 +358,14 @@ def prepare_priors(controller, source, extra, config):
     standing = np.clip(standing, *controller.target_limits.T)
     blend = base.smoothstep((grid - 0.06) / (1.42 - 0.06))[:, None]
     nominal = start * (1 - blend) + standing * blend
-    old = source["action"][156:170].copy()
+    old = source["action"][config.prefix_controls :].copy()
+    old_controls = len(old)
+    old_duration = old_controls * config.control_dt
     prior = np.repeat(old[-1:], config.horizon, axis=0)
-    prior[:14] = old
-    blend = base.smoothstep((grid - 0.28) / (1.42 - 0.28))[:, None]
+    prior[:old_controls] = old
+    blend = base.smoothstep((grid - old_duration) / (1.42 - old_duration))[:, None]
     prior = prior * (1 - blend) + standing * blend
-    priors = {"old60_14controls_then_standing_not_teacher": prior}
+    priors = {f"old60_{old_controls}controls_then_standing_not_teacher": prior}
     if extra is not None:
         q6 = np.asarray(extra["candidate_right_leg_q6"])
         tuck = prior.copy()
@@ -380,7 +383,9 @@ def prepare_priors(controller, source, extra, config):
         {
             "standing_target": standing.tolist(),
             "nominal": "last actual target held +.06, quintic standing by +1.42",
-            "legacy": "exact14 old60 targets to3.40, quintic standing +.28→+1.42",
+            "legacy": "exact14 old60 targets to3.40, quintic standing +.28→+1.42"
+            if old_controls == 14 and config.control_dt == 0.02
+            else f"exact{old_controls} old60 targets, quintic standing +{old_duration:.2f}→+1.42",
             "tuck": "other23 legacy targets; right6 drive to+.02, quintic tuck by+.08, hold to+.30, quintic standing by+1.42"
             if extra
             else None,
@@ -561,17 +566,19 @@ def momentum_cost(controller, states, sensors, targets, config):
     }
     cost = sum(terms.values())
     valid = np.isfinite(states).all((1, 2)) & np.isfinite(sensors).all((1, 2)) & np.isfinite(cost)
-    valid &= np.isclose(states[:, -1, 0], 5.14, rtol=0, atol=1e-9)
+    prefix_time = config.prefix_controls * config.control_dt
+    episode_end = (config.prefix_controls + config.horizon) * config.control_dt
+    valid &= np.isclose(states[:, -1, 0], episode_end, rtol=0, atol=1e-9)
     grade = np.where(valid, grade, -1)
     metrics = {
-        "anchor_time_s": 3.12 + times[anchor_id],
+        "anchor_time_s": prefix_time + times[anchor_id],
         "board_com_vz_at_anchor_m_s": board_vz[np.arange(count), anchor_id],
         "maximum_whole_board_clearance_m": lower.max(1),
         "maximum_penetration_m": depth.max(1),
         "robot_ground_fraction": robot_ground.mean(1),
         "maximum_actual_joint_limit_violation_rad": np.maximum(limits.max(1), lastlimit),
         "first_qualified_flight_start_s": np.where(
-            qualified.any(1), 3.12 + np.argmax(qualified, 1) * config.physics_dt, -1
+            qualified.any(1), prefix_time + np.argmax(qualified, 1) * config.physics_dt, -1
         ),
         "tail_selected_contact_max_fn_n": tail_selected_fn.max(1),
         "minimum_front_20ms_touch_n": load20["left"].min(1),
@@ -624,8 +631,13 @@ def execute_winner(controller, source, prefix_records, targets, predicted, confi
     """65's complete/partial persistence, plus same-step execution normal loads."""
     m, data, ix = controller.model, controller.data, controller.index
     records, forces = list(prefix_records), []
-    arrays = {name: [v.copy() for v in source[name][:157]] for name in ("state", "qpos", "qvel")}
-    actions, times = list(source["action"][:156].copy()), list(source["time_physics"][:157])
+    prefix_controls = config.prefix_controls
+    arrays = {
+        name: [v.copy() for v in source[name][: prefix_controls + 1]]
+        for name in ("state", "qpos", "qvel")
+    }
+    actions = list(source["action"][:prefix_controls].copy())
+    times = list(source["time_physics"][: prefix_controls + 1])
     failure, partial, maximum = None, None, 0.0
     committed_control_count = config.prefix_controls
     for frame, target in enumerate(targets):
@@ -681,7 +693,7 @@ def execute_winner(controller, source, prefix_records, targets, predicted, confi
             del times[committed_control_count + 1 :]
             if advanced and committed_control_count < config.prefix_controls + frame + 1:
                 partial = {
-                    "control_step": 156 + frame,
+                    "control_step": prefix_controls + frame,
                     "target": target.tolist(),
                     "native_substeps_advanced": advanced,
                     "actual_time_s": float(data.time),
@@ -806,7 +818,8 @@ def save_branch(path, candidate):
     )
 
 
-def main():
+def build_argument_parser():
+    """Common frozen-input/observation/IO options for a bounded experiment."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("inspect", "benchmark", "run"), default="inspect")
     parser.add_argument(
@@ -827,13 +840,35 @@ def main():
     parser.add_argument("--extra-prior-result", type=Path)
     parser.add_argument("--extra-prior-result-sha256")
     parser.add_argument("--out-dir", type=Path, required=True)
-    args = parser.parse_args()
+    return parser
+
+
+def run_experiment(
+    args,
+    config,
+    cost_function=momentum_cost,
+    prior_factory=prepare_priors,
+    source_sha=SOURCE_SHA,
+    schema=SCHEMA,
+    manifest_extra=None,
+    elite_selector=None,
+):
+    """Run the shared native protocol with explicitly supplied cost and priors.
+
+    ``cost_function(controller, states, sensors, targets, config)`` returns
+    ``(grades, costs, terms, metrics)``. ``prior_factory`` has the same signature
+    and return contract as ``prepare_priors``; its first prior seeds the mean.
+    Args are the Namespace from ``build_argument_parser`` (possibly extended).
+    ``manifest_extra`` records caller provenance without replacing frozen data.
+    The caller owns configuration approval; this API never starts an extra run.
+    """
+    parser = build_argument_parser()
     if args.out_dir.exists():
         parser.error("A fresh output directory is required")
-    config, started = Config(), time.monotonic()
+    started = time.monotonic()
     sources = {}
     for name, expected in (
-        ("source", SOURCE_SHA),
+        ("source", source_sha),
         ("reference", base.REFERENCE_HASH),
         ("feedforward", base.FEEDFORWARD_HASH),
     ):
@@ -870,8 +905,8 @@ def main():
         if not (
             extra["static_geometry_pass"]
             and not extra["is_teacher"]
-            and extra["source_sha256"] == SOURCE_SHA
-            and extra["source_control_frame"] == 156
+            and extra["source_sha256"] == source_sha
+            and extra["source_control_frame"] == config.prefix_controls
             and extra["all_other_qpos_exact"]
             and tuple(extra["joint_names29"]) == G1_JOINT_NAMES
         ):
@@ -910,7 +945,7 @@ def main():
         Path("src/supermimic/ollie/physics.py"),
     )
     manifest = {
-        "schema": SCHEMA + ".manifest",
+        "schema": schema + ".manifest",
         "mode": args.mode,
         "config": asdict(config),
         "sources": sources,
@@ -927,6 +962,8 @@ def main():
         "observer_stage": "canonical post mj_forward .1N; original strict v3 unchanged",
         "selection": "highest grade, lowest fixed cost; one evaluated complete winner; preserve best each grade",
     }
+    if manifest_extra is not None:
+        manifest["experiment"] = manifest_extra
     args.out_dir.mkdir(parents=True)
     write_json(args.out_dir / "frozen_manifest.json", manifest)
     if args.mode == "inspect":
@@ -942,8 +979,9 @@ def main():
         controller.prefix_records = prefix_records
         write_json(args.out_dir / "prefix_proof.json", proof)
         write_json(
-            args.out_dir / "old60_14control_regression.json",
-            continuation_regression(controller, source),
+            args.out_dir
+            / f"old60_{len(source['action']) - config.prefix_controls}control_regression.json",
+            continuation_regression(controller, source, config),
         )
         if (
             controller.model.npair
@@ -955,7 +993,7 @@ def main():
                 "Expected original unconstrained passive board and default contact model"
             )
         model_proof = add_sensors(controller, config)
-        nominal, priors, metadata = prepare_priors(controller, source, extra, config)
+        nominal, priors, metadata = prior_factory(controller, source, extra, config)
         write_json(
             args.out_dir / "model_and_prior_proof.json", {"model": model_proof, "prior": metadata}
         )
@@ -994,7 +1032,7 @@ def main():
             states, sensors = controller.rollout(targets)
             rollout_wall = time.monotonic() - tick
             tick = time.monotonic()
-            grades, costs, terms, metrics = momentum_cost(
+            grades, costs, terms, metrics = cost_function(
                 controller, states, sensors, targets, config
             )
             cost_wall = time.monotonic() - tick
@@ -1002,7 +1040,18 @@ def main():
             order = order[np.isfinite(costs[order]) & (grades[order] >= 0)]
             if not len(order):
                 raise RuntimeError("No finite complete branch")
-            winner, elites = int(order[0]), order[: config.elites]
+            winner = int(order[0])
+            elites = (
+                order[: config.elites]
+                if elite_selector is None
+                else np.asarray(elite_selector(order, grades, costs, config), dtype=int)
+            )
+            if (
+                not 1 <= len(elites) <= config.elites
+                or len(np.unique(elites)) != len(elites)
+                or not np.isin(elites, order).all()
+            ):
+                raise ValueError("Elite selector must return unique finite evaluated candidates")
             for grade_id in (0, 1, 2):
                 selected = order[grades[order] == grade_id]
                 if not len(selected):
@@ -1108,6 +1157,7 @@ def main():
             controller, source, prefix_records, best[2], best[3], config
         )
         result.update(
+            schema=schema,
             frozen_manifest=manifest,
             winner_exploration_grade=best[0],
             winner_cost=best[1],
@@ -1121,7 +1171,7 @@ def main():
             args.out_dir / "actual_rollout.npz",
             **arrays,
             time_video=arrays["time_physics"] * 1.5,
-            control_dt=np.asarray(0.02),
+            control_dt=np.asarray(config.control_dt),
             robot_joint_names=np.asarray(G1_JOINT_NAMES),
             board_joint_names=np.asarray(BOARD_JOINT_NAMES),
             verified_teacher=np.asarray(False),
@@ -1147,7 +1197,8 @@ def main():
                 "error": str(error) or type(error).__name__,
                 "actual_endpoint_s": float(controller.data.time),
                 "completed_search_rounds": len(reports),
-                "main_actual_continuation_executed": controller.data.time > 3.12 + 1e-9,
+                "main_actual_continuation_executed": controller.data.time
+                > config.prefix_controls * config.control_dt + 1e-9,
                 "main_fingerprint": fingerprint(controller.data, controller.model),
                 "wall_seconds": time.monotonic() - started,
                 "best_evaluated_grade": best[0] if best else None,
@@ -1157,6 +1208,10 @@ def main():
         raise
     finally:
         controller.pool.close()
+
+
+def main():
+    run_experiment(build_argument_parser().parse_args(), Config())
 
 
 if __name__ == "__main__":

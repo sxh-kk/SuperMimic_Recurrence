@@ -124,3 +124,15 @@ env -u PYTHONPATH -u PYTHONHOME CUDA_VISIBLE_DEVICES='' \
   --extra-prior-result-sha256 aabf09b1cffe7ee621c785960e3a7832dce2439450ac7331d4b5b6dbcff487ff \
   --out-dir logs/new_momentum_release_inspect
 ```
+
+## 兼容性重构
+
+为后续独立试验复用原生回放、proof、预算和归档流程，入口提取为 `build_argument_parser()` 与 `run_experiment(args, config, cost_function=momentum_cost, prior_factory=prepare_priors, source_sha=SOURCE_SHA, schema=SCHEMA, manifest_extra=None)`。新入口可显式传入更早的热前缀配置、单独的成本和先验工厂，`manifest_extra` 仅写入独立 experiment 元数据，不替换底层冻结信息。成本函数返回 `(grades, costs, terms, metrics)`；先验工厂仍接收 `(controller, source, extra, config)`，返回 nominal、有序 priors 和 metadata，第一个 prior 用于初始 mean。
+
+仅参数化前缀控制数、剩余旧控制数、时间标签与预期后缀终点。76 默认 Config、物理模型、成本数值、控制顺序、排序和最终 257 控制/5.14 s 判定不变。原 76 正式运行源码 SHA `bea4d2137d4313497b68e6720b13297cf192af8528f258e663664c72a2a92cc5` 与历史结果原样保留；重构后的源码 SHA 为 `b305c0b58c7069836a66f5c0faa6c207b6ce04f9634439fb430e6a6159e4118b`。
+
+`logs/ollie_momentum_release_refactor_01/compatibility.json` 使用已有 grade1、grade2 和 winner 的完整保存分支，重新计算新旧 grade/cost/全部 terms/metrics，所有差值均为 0，且与历史保存的 grade/cost 逐值相同；winner 成本仍为 5902.668898016805。默认 nominal、两个先验的值/标签/metadata 逐值不变；Config、物理数组比较、观察模型、原生法向力 proof 等未改函数的 AST 相同。纯 fake-time 完整执行器的新旧 result、规则边界数组、接触与力记录也逐值相同。P150/H107 的先验形状及原 20 个旧控制切片检查通过。
+
+兼容性检查只读取已有分支、做纯 forward 和 CPU 数组运算，fake step 只推进时间；真实积分次数为 0、GPU 初始化为 0，没有重跑 benchmark、搜索或训练。它证明默认 76 的兼容性，不证明后续新配置的物理行为。
+
+后续81增加可选`elite_selector`回调；未传时仍执行原`order[:config.elites]`，固定76/80默认排序未改变。81前的b305协议源码按原hash保存在80实际目录，避免后来代码覆盖运行来源。接口增补与独立无积分检查详见[81](81_Ollie保留真实起跳的接板搜索.md)。
