@@ -12,7 +12,12 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from supermimic.ollie.physics import BOARD_JOINT_NAMES, WHEEL_RADIUS, compile_scene
+from supermimic.ollie.physics import (
+    BOARD_GEOM_NAMES,
+    BOARD_JOINT_NAMES,
+    WHEEL_RADIUS,
+    compile_scene,
+)
 from supermimic.ollie.state import JointStateIndices
 
 
@@ -24,6 +29,7 @@ class JointEnvConfig:
     max_contacts: int = 128
     max_constraints: int = 512
     cuda_graph: bool = True
+    foot_deck_friction: float | None = None
 
 
 class JointPhysicsEnv:
@@ -39,7 +45,9 @@ class JointPhysicsEnv:
             raise ValueError("control_dt must be an integer multiple of physics_dt")
         self.device = torch.device(device)
         self.num_envs = self.cfg.num_envs
-        self.native_model, native_data, self.index = compile_scene(timestep=self.cfg.physics_dt)
+        self.native_model, native_data, self.index = compile_scene(
+            timestep=self.cfg.physics_dt, foot_deck_friction=self.cfg.foot_deck_friction
+        )
         self.indices = JointStateIndices.from_model(
             self.native_model, board_joint_names=BOARD_JOINT_NAMES
         )
@@ -66,6 +74,17 @@ class JointPhysicsEnv:
         self.wheel_body_ids = torch.tensor(
             [self.native_model.body(name.removesuffix("_joint")).id for name in BOARD_JOINT_NAMES],
             device=self.device,
+        )
+        # The authored envelope consists of five boxes followed by four wheel
+        # cylinders. Geom poses include their local offsets and orientations.
+        self.board_geometry_names = BOARD_GEOM_NAMES + tuple(
+            name.removesuffix("_joint") + "_collision" for name in BOARD_JOINT_NAMES
+        )
+        board_geom_ids = [self.native_model.geom(name).id for name in self.board_geometry_names]
+        self.board_geometry_ids = torch.tensor(board_geom_ids, device=self.device)
+        self.board_geometry_sizes = torch.as_tensor(
+            self.native_model.geom_size[board_geom_ids].copy(),
+            device=self.device, dtype=self.qpos.dtype,
         )
         joint_ids = [self.native_model.actuator_trnid[a, 0] for a in self.index.robot_actuators]
         self.joint_limits = torch.as_tensor(
@@ -131,12 +150,33 @@ class JointPhysicsEnv:
         return self.indices.pack(self.qpos, self.qvel)
 
     def diagnostics(self) -> dict[str, torch.Tensor]:
+        """Read-only endpoint diagnostics; every clearance is measured in metres.
+
+        ``whole_board_geometry_clearance`` columns follow
+        ``board_geometry_names`` (five boxes, then four cylinders). These
+        geometric clearances alone do not certify a contact-free flight.
+        """
         state = self.state()
         robot, board = self.layout.split(state)
+        # Legacy wheel-centre minus radius proxy: keep its historical meaning.
         wheels = self.wp.to_torch(self.data.xpos)[:, self.wheel_body_ids, 2] - WHEEL_RADIUS
+        geom_pos = self.wp.to_torch(self.data.geom_xpos)[:, self.board_geometry_ids]
+        geom_rot = self.wp.to_torch(self.data.geom_xmat)[:, self.board_geometry_ids]
+        box_count = len(BOARD_GEOM_NAMES)
+        box_extent = (
+            geom_rot[:, :box_count, 2].abs() * self.board_geometry_sizes[:box_count]
+        ).sum(-1)
+        wheel_axis_z = geom_rot[:, box_count:, 2, 2]
+        wheel_sizes = self.board_geometry_sizes[box_count:]
+        wheel_extent = wheel_sizes[:, 0] * (1 - wheel_axis_z.square()).clamp_min(0).sqrt()
+        wheel_extent = wheel_extent + wheel_sizes[:, 1] * wheel_axis_z.abs()
+        clearance = geom_pos[..., 2] - torch.cat((box_extent, wheel_extent), dim=-1)
         upright = 1 - 2 * (robot[:, 4].square() + robot[:, 5].square())
         return {
             "board_height": board[:, 2], "minimum_wheel_clearance": wheels.min(-1).values,
+            "whole_board_geometry_clearance": clearance,
+            "minimum_whole_board_clearance": clearance.min(-1).values,
+            "minimum_wheel_geometry_clearance": clearance[:, box_count:].min(-1).values,
             "root_height": robot[:, 2], "root_upright": upright,
             "robot_board_xy_distance": (robot[:, :2] - board[:, :2]).norm(dim=-1),
             "finite": torch.isfinite(state).all(-1),
