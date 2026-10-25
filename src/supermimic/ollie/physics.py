@@ -109,12 +109,22 @@ def make_board_spec(*, ground: bool = True, timestep: float = 0.0025) -> mujoco.
 def make_scene_spec(
     *, include_robot: bool = True, timestep: float = 0.0025,
     robot_yaw: float = math.pi / 2,
+    foot_deck_friction: float | None = None,
 ) -> mujoco.MjSpec:
     """Compose the exact mjlab G1 actuators/collisions with a passive board.
 
     G1 names are unchanged. Its 29 actuator indices need not match CSV joint
     order; use SceneIndex.robot_actuators when assigning joint targets.
+
+    The legacy default keeps G1's priority-1 foot friction (0.6), which
+    overrides the board's 0.9. An explicit foot_deck_friction adds only
+    foot/deck contact pairs, retaining foot compliance and foot/ground
+    behavior. Such a value is a model assumption, not material calibration.
     """
+    if foot_deck_friction is not None and (
+        not include_robot or not math.isfinite(foot_deck_friction) or foot_deck_friction <= 0
+    ):
+        raise ValueError("foot_deck_friction requires a robot and a positive finite value")
     if not include_robot:
         return make_board_spec(timestep=timestep)
     from mjlab.asset_zoo.robots import get_g1_robot_cfg
@@ -137,6 +147,24 @@ def make_scene_spec(
         frame=spec.worldbody.add_frame(),
     )
     _add_ground_and_light(spec)
+    if foot_deck_friction is not None:
+        for side in ("left", "right"):
+            for i in range(1, 8):
+                foot = spec.geom(f"{side}_foot{i}_collision")
+                for part in ("center", "tail", "nose"):
+                    spec.add_pair(
+                        name=f"ollie_foot_deck_{side}_{i}_{part}",
+                        geomname1=foot.name,
+                        geomname2=f"board_{part}",
+                        condim=int(foot.condim),
+                        friction=[foot_deck_friction, foot_deck_friction,
+                                  float(foot.friction[1]), float(foot.friction[2]),
+                                  float(foot.friction[2])],
+                        solref=foot.solref.tolist(),
+                        solimp=foot.solimp.tolist(),
+                        margin=float(foot.margin),
+                        gap=float(foot.gap),
+                    )
     return spec
 
 

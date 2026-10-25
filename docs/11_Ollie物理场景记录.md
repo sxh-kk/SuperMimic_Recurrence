@@ -30,6 +30,8 @@
 
 ## 命名与状态接口
 
+2026-10-25 建模审计补记：板XML参数不等于实际足板pair参数。G1脚priority1覆盖板priority0，原足板实际μ=0.6、solref=[0.02,1]；尾地仍为μ=0.9、solref=[0.008,1]。`make_scene_spec(foot_deck_friction=...)`现可显式指定仅足板摩擦，默认None保留旧物理，未将0.9或1.2晋升为真实材料值。实际参数读取、有限nose向上力边界与尾撞组件检查见[模型审计61](61_Ollie滑板与足板接触模型审计.md)。
+
 G1 的名字保持原样：根 body 为 `pelvis`，freejoint 为 `floating_base_joint`，关节采用原 `G1_JOINT_NAMES`。滑板为：
 
 - 根 body：`board`；自由关节：`board_free`。
