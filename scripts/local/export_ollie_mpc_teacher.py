@@ -124,7 +124,6 @@ def verify(reference_path, source_dir):
                    board_xy_displacement_m=float(np.linalg.norm(data.xpos[index.board_body, :2]
                                                                - source["qpos"][0, index.board_qpos:index.board_qpos + 2])))
         records.append(row)
-        torques.append(data.actuator_force[index.robot_actuators].copy())
 
     observe()
     q_error = v_error = state_error = 0.
@@ -133,6 +132,9 @@ def verify(reference_path, source_dir):
         for _ in range(8):
             previous_time = float(data.time)
             mujoco.mj_step(model, data)
+            # Read the force used by this physical step before diagnostic
+            # mj_forward recomputes the actuator force at the new state.
+            torques.append(data.actuator_force[index.robot_actuators].copy())
             mujoco.mj_forward(model, data)
             require(np.isclose(data.time, previous_time + .0025, rtol=0, atol=1e-12), "physical time discontinuity")
             require(np.isfinite(data.qpos).all() and np.isfinite(data.qvel).all(), "native nonfinite state")
@@ -167,6 +169,8 @@ def verify(reference_path, source_dir):
         "maximum_target_limit_violation_rad": max(0., target_violation),
         "maximum_actual_torque_limit_violation_nm": max(0., tau_violation),
         "maximum_actual_torque_cap_fraction": float((abs(torques) / np.max(abs(force_limits), axis=1)).max()),
+        "actual_torque_sampling_stage": "after mj_step, before diagnostic mj_forward",
+        "actual_torque_samples": len(torques),
     }
     s = metrics
     gates = {

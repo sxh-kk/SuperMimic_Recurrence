@@ -16,6 +16,8 @@
 - [导出验收记录](/home/zxc/SuperMimic/logs/ollie_mpc_teacher_v4_02/result.json)。初次`v4_01`与最终原子发布版本`v4_02`的teacher文件SHA完全相同。
 - [字段与拒绝检查](/home/zxc/SuperMimic/logs/ollie_mpc_teacher_export_audit_01/result.json)。
 
+2026-10-25 修正力矩采样阶段后仅重导到`logs/ollie_mpc_teacher_v4_execution_tau_01/`，新teacher SHA256 `125d24e54bf5b6865fdc31871d795f1c230b772f300cf4ecf6f75c33c44e65a0`。新旧teacher除`metadata_json`外所有数组逐值相同，包含动作、状态和terminal integration；19项gate逐值相同且全通过。metadata将峰cap比例更正为1.0，并记录1104个执行阶段样本。旧文件保留，历史BC/DAgger仍绑定原SHA，没有重训或静默替换教师。
+
 入口固定校验三个已明确接受的SHA：
 
 - v4参考：`38243f1cc2c37ce1461817e83ced08410d90a332692a8c1d44dbb89dd54994e7`。
@@ -36,7 +38,7 @@
 - 最小upright **0.92158**，无身体触地；最大穿透 **4.220 mm**、实际软关节越界 **0.01207 rad**。
 - 独立FK足高度/XY最大误差 **3.063/11.843 mm**；root高度RMSE **6.239 mm**。
 - 左右足支持 **99.638%/99.729%**，末300 ms均100%；唯一4轮接地 **99.005%**。
-- 实际目标、实际tau均未超原限制；tau最高为cap的 **83.96%**。没有将“目标合法”替代“实际关节角合法”。
+- 实际目标、实际tau均未超原限制。旧记录 **83.96%** 属于额外forward后诊断值；2026-10-25 独立执行阶段复核发现准备段左腕pitch曾到100%，腿峰35.59%。导出器已改为每次`mj_step`后、诊断forward前读取1104个实际力矩，19项门槛保持原值。旧教师文件与历史实验不改写，不据此重新训练。没有将“目标合法”替代“实际关节角合法”。
 
 所有门槛与文档48/52/53相同，没有为导出放松质量。`verified_teacher=True`仅覆盖上述物理准备前缀；元数据明确`steady_state=False`、`robustness_verified=False`、`ollie_success_certified=False`。
 
